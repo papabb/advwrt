@@ -1,0 +1,72 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_checkpoints
+
+# Model checkpoints and outputs
+lora_model_A/
+lora_model_B/
+outputs/
+grpo_trainer_lora_model/
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# CUDA toolkit symlinks (created dynamically)
+~/cuda-12.8/
+/tmp/cuda_*/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Cache
+.cache/
+*.cache
+
+# Unsloth compiled cache (can be regenerated)
+unsloth_compiled_cache/
+
+# Temporary files
+*.tmp
+*.temp
+

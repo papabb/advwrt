@@ -1,0 +1,1 @@
+cd /home/bbai/temp/adv && conda activate Adversarial && export CUDA_HOME=/usr/local/cuda-12.8 2>/dev/null || export CUDA_HOME=$(python -c "import torch; import os; print(os.path.dirname(os.path.dirname(torch.utils.cmake_prefix_path)))" 2>/dev/null) || export CUDA_HOME=/usr/local/cuda && python financial_adversarial_grpo.py --mode train 2>&1 | head -60
