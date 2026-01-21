@@ -740,9 +740,18 @@ def train_models():
         shutil.rmtree("grpo_trainer_lora_model")
         print("Cleared previous GRPO checkpoint directory")
     
+    # Calculate steps per epoch for logging
+    # Steps per epoch = dataset_size / (batch_size * gradient_accumulation_steps)
+    batch_size = 1
+    gradient_accumulation = 1
+    steps_per_epoch_A = max(1, len(dataset_A) // (batch_size * gradient_accumulation))
+    steps_per_epoch_B = max(1, len(dataset_B) // (batch_size * gradient_accumulation))
+    
     # Train Model A
     print("\n" + "="*50)
     print("Training Model A (Saboteur)...")
+    print(f"Dataset size: {len(dataset_A)} examples")
+    print(f"Steps per epoch: {steps_per_epoch_A}")
     print("="*50)
     
     training_args_A = GRPOConfig(
@@ -753,14 +762,17 @@ def train_models():
         warmup_ratio=0.1,
         lr_scheduler_type="linear",
         optim="adamw_8bit",
-        logging_steps=1,
+        logging_steps=max(1, steps_per_epoch_A // 10),  # Log ~10 times per epoch
         per_device_train_batch_size=1,
         gradient_accumulation_steps=1,
         num_generations=2,  # Reduced from 4 to save memory (GRPO generates multiple completions)
         max_prompt_length=max_prompt_length_A,
         max_completion_length=max_completion_length_A,
-        max_steps=10,  # Reduced for testing (can increase later)
-        save_steps=50,
+        num_train_epochs=3,  # Train for 3 epochs
+        max_steps=-1,  # Disable step-based training, use epochs instead
+        save_steps=steps_per_epoch_A,  # Save once per epoch
+        eval_strategy="no",  # No evaluation dataset
+        logging_strategy="steps",  # Log at regular step intervals
         report_to="none",
         output_dir="outputs/model_A",
     )
@@ -788,8 +800,19 @@ def train_models():
         train_dataset=dataset_A,
     )
     
+    print("\nStarting training...")
+    print("Loss will be logged during training. Check output for progress.\n")
     trainer_A.train()
-    # Save adapter_A (default adapter)
+    
+    # Print final training metrics
+    print("\n" + "="*50)
+    print("Model A Training Complete!")
+    print("="*50)
+    if hasattr(trainer_A.state, 'log_history'):
+        for log_entry in trainer_A.state.log_history:
+            if 'loss' in log_entry:
+                print(f"Step {log_entry.get('step', 'N/A')}: Loss = {log_entry['loss']:.4f}")
+    
     model_A.save_pretrained("lora_model_A")
     
     # Clear GRPO checkpoint directory after Model A training
@@ -814,6 +837,8 @@ def train_models():
     # Train Model B
     print("\n" + "="*50)
     print("Training Model B (Detector)...")
+    print(f"Dataset size: {len(dataset_B)} examples")
+    print(f"Steps per epoch: {steps_per_epoch_B}")
     print("="*50)
     
     training_args_B = GRPOConfig(
@@ -824,14 +849,17 @@ def train_models():
         warmup_ratio=0.1,
         lr_scheduler_type="linear",
         optim="adamw_8bit",
-        logging_steps=1,
+        logging_steps=max(1, steps_per_epoch_B // 10),  # Log ~10 times per epoch
         per_device_train_batch_size=1,
         gradient_accumulation_steps=1,
         num_generations=2,  # Reduced from 4 to save memory (GRPO generates multiple completions)
         max_prompt_length=max_prompt_length_B,
         max_completion_length=max_completion_length_B,
-        max_steps=10,  # Reduced for testing (can increase later)
-        save_steps=50,
+        num_train_epochs=3,  # Train for 3 epochs
+        max_steps=-1,  # Disable step-based training, use epochs instead
+        save_steps=steps_per_epoch_B,  # Save once per epoch
+        eval_strategy="no",  # No evaluation dataset
+        logging_strategy="steps",  # Log at regular step intervals
         report_to="none",
         output_dir="outputs/model_B",
     )
@@ -900,8 +928,19 @@ def train_models():
         train_dataset=dataset_B,
     )
     
+    print("\nStarting training...")
+    print("Loss will be logged during training. Check output for progress.\n")
     trainer_B.train()
-    # Save adapter_B (currently named "default") separately
+    
+    # Print final training metrics
+    print("\n" + "="*50)
+    print("Model B Training Complete!")
+    print("="*50)
+    if hasattr(trainer_B.state, 'log_history'):
+        for log_entry in trainer_B.state.log_history:
+            if 'loss' in log_entry:
+                print(f"Step {log_entry.get('step', 'N/A')}: Loss = {log_entry['loss']:.4f}")
+    
     model_B.save_pretrained("lora_model_B")
     
     # Rename "default" back to "adapter_B" after training
