@@ -54,6 +54,12 @@ conda activate Adversarial
 pip install unsloth vllm transformers==4.56.2
 pip install --no-deps trl==0.22.2
 pip install datasets pandas numpy torch
+pip install pytz six idna certifi pyyaml markupsafe
+```
+
+Or using conda:
+```bash
+conda install -y pytz six idna certifi pyyaml markupsafe
 ```
 
 Or if using the notebook, the installation cell will handle this automatically.

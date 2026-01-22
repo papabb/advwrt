@@ -215,11 +215,12 @@ detection_end = "<DETECTION_END>"
 print("Initializing shared model with two LoRA adapters...")
 
 # Load base model once (shared between A and B)
+# Note: fast_inference=False to avoid vLLM LoRA manager compatibility issues with vLLM 0.14.0
 base_model, tokenizer = FastLanguageModel.from_pretrained(
     model_name=base_model_name,
     max_seq_length=max_seq_length,
     load_in_4bit=False,
-    fast_inference=True,
+    fast_inference=False,  # Disabled due to vLLM 0.14.0 LoRA manager API incompatibility
     max_lora_rank=lora_rank,
     gpu_memory_utilization=0.4,  # Reduced to leave more room for GRPO generation
 )
@@ -999,15 +1000,22 @@ def adversarial_game_loop(num_iterations=5):
         ]
         
         text_A = tokenizer_A.apply_chat_template(messages_A, add_generation_prompt=True, tokenize=False)
-        sampling_params = SamplingParams(temperature=0.7, top_k=50, max_tokens=1024)
         
         # Use default adapter for Model A
         default_adapter_name = list(model_A.peft_config.keys())[0] if hasattr(model_A, 'peft_config') and model_A.peft_config else "default"
         model_A.set_adapter(default_adapter_name)
-        output_A = model_A.fast_generate(
-            text_A,
-            sampling_params=sampling_params,
-        )[0].outputs[0].text
+        
+        # Use regular generation since fast_inference is disabled
+        inputs_A = tokenizer_A(text_A, return_tensors="pt").to(model_A.device)
+        with torch.no_grad():
+            outputs_A = model_A.generate(
+                **inputs_A,
+                max_new_tokens=1024,
+                temperature=0.7,
+                top_k=50,
+                do_sample=True,
+            )
+        output_A = tokenizer_A.decode(outputs_A[0][inputs_A['input_ids'].shape[1]:], skip_special_tokens=True)
         
         sabotaged_report = output_A.strip()
         print(f"Sabotaged report (first 200 chars): {sabotaged_report[:200]}...")
@@ -1021,12 +1029,26 @@ def adversarial_game_loop(num_iterations=5):
         
         text_B = tokenizer_B.apply_chat_template(messages_B, add_generation_prompt=True, tokenize=False)
         
-        # Use adapter_B for Model B
-        model_B.set_adapter("adapter_B")
-        output_B = model_B.fast_generate(
-            text_B,
-            sampling_params=sampling_params,
-        )[0].outputs[0].text
+        # Use adapter_B for Model B, or default adapter if adapter_B doesn't exist (e.g., in game mode without training)
+        if hasattr(model_B, 'peft_config') and model_B.peft_config and "adapter_B" in model_B.peft_config:
+            model_B.set_adapter("adapter_B")
+        else:
+            # Fallback to default adapter if adapter_B not found (for game mode without prior training)
+            default_adapter_name_B = list(model_B.peft_config.keys())[0] if hasattr(model_B, 'peft_config') and model_B.peft_config else "default"
+            model_B.set_adapter(default_adapter_name_B)
+            print("Note: Using default adapter for Model B (adapter_B not found - run training first for separate adapters)")
+        
+        # Use regular generation since fast_inference is disabled
+        inputs_B = tokenizer_B(text_B, return_tensors="pt").to(model_B.device)
+        with torch.no_grad():
+            outputs_B = model_B.generate(
+                **inputs_B,
+                max_new_tokens=1024,
+                temperature=0.7,
+                top_k=50,
+                do_sample=True,
+            )
+        output_B = tokenizer_B.decode(outputs_B[0][inputs_B['input_ids'].shape[1]:], skip_special_tokens=True)
         
         detections = extract_detections(output_B)
         print(f"Model B detections: {detections}")
