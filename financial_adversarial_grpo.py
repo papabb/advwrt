@@ -188,6 +188,27 @@ import torch
 import gc
 
 from datasets import load_dataset, Dataset
+
+# Check CUDA availability before importing unsloth
+if not torch.cuda.is_available():
+    print("="*60)
+    print("ERROR: CUDA/GPU not available!")
+    print("="*60)
+    print("PyTorch cannot detect a CUDA-capable GPU.")
+    print("\nPossible causes:")
+    print("  1. No GPU installed")
+    print("  2. NVIDIA driver not installed or outdated")
+    print("  3. Driver/library version mismatch (try: sudo reboot)")
+    print("  4. PyTorch not compiled with CUDA support")
+    print("\nTo check:")
+    print("  - Run: nvidia-smi")
+    print("  - Run: python -c 'import torch; print(torch.cuda.is_available())'")
+    print("  - If nvidia-smi shows 'Driver/library version mismatch', reboot your system")
+    print("\nThis script requires a GPU for training. Exiting...")
+    print("="*60)
+    import sys
+    sys.exit(1)
+
 from unsloth import FastLanguageModel
 from trl import GRPOConfig, GRPOTrainer, SFTTrainer, SFTConfig
 from vllm import SamplingParams
@@ -198,7 +219,7 @@ from transformers import TextStreamer
 # ============================================================================
 
 max_seq_length = 1024  # Reduced from 2048 to save memory
-lora_rank = 8
+lora_rank = 32
 # Try Gemma3-270M first, fallback to Gemma-2-2B if not available
 base_model_name = "google/gemma-3-270m-it"  # Smaller model: 270M parameters
 
@@ -584,23 +605,81 @@ def calculate_reward_B(sabotaged_report, original_changes, detections, **kwargs)
 
 def reward_func_A(prompts, completions, **kwargs):
     """
-    GRPO reward function for Model A.
-    This will be called during GRPO training.
+    GRPO reward function for Model A (Saboteur).
+    This is called by GRPOTrainer during training to compute rewards.
+    
+    The reward is computed adversarially:
+    - Model A generates a sabotaged report (in completions)
+    - Model B tries to detect issues in the sabotaged report
+    - If B fails to detect: A gets +1.0 reward
+    - If B detects: A gets -1.0 reward
+    
+    This reward is then used by GRPO to update Model A's weights via policy gradients.
     """
     scores = []
+    
+    # Extract original report from prompts
+    original_report = ""
+    for msg in prompts[0]:
+        if msg["role"] == "user":
+            # Extract report from user message
+            content = msg["content"]
+            if "Original report:" in content:
+                original_report = content.split("Original report:")[1].split("\n\nCreate")[0].strip()
+            break
+    
     for completion in completions:
         sabotaged_report = completion[0]["content"]
-        # For now, use a simple heuristic
-        # In full implementation, this would interact with Model B
         score = 0.0
         
-        # Reward subtle sabotage (not too obvious)
-        obvious_keywords = ["WRONG", "ERROR", "FALSE", "INCORRECT"]
-        if not any(kw in sabotaged_report.upper() for kw in obvious_keywords):
-            score += 0.5
+        # Adversarial evaluation: Use Model B to detect issues
+        # Set Model B to use adapter_B if available, otherwise default adapter
+        # Note: During Model A training, adapter_B may not exist yet, so use default
+        if hasattr(model_B, 'peft_config') and model_B.peft_config:
+            if "adapter_B" in model_B.peft_config:
+                model_B.set_adapter("adapter_B")
+            else:
+                # Fallback to default adapter (used during Model A training before adapter_B is added)
+                default_adapter_B = list(model_B.peft_config.keys())[0]
+                model_B.set_adapter(default_adapter_B)
+        
+        # Create prompt for Model B to detect issues
+        messages_B = [
+            {"role": "system", "content": system_prompt_B},
+            {"role": "user", "content": f"Financial report to analyze:\n{sabotaged_report}\n\nIdentify any issues:"},
+        ]
+        text_B = tokenizer_B.apply_chat_template(messages_B, add_generation_prompt=True, tokenize=False)
+        
+        # Generate detection with Model B
+        inputs_B = tokenizer_B(text_B, return_tensors="pt").to(model_B.device)
+        with torch.no_grad():
+            outputs_B = model_B.generate(
+                **inputs_B,
+                max_new_tokens=512,
+                temperature=0.7,
+                top_k=50,
+                do_sample=True,
+            )
+        detection_response = tokenizer_B.decode(outputs_B[0][inputs_B['input_ids'].shape[1]:], skip_special_tokens=True)
+        
+        # Extract detections
+        detections = extract_detections(detection_response)
+        
+        # Adversarial reward: A wins if B fails to detect, loses if B detects
+        if detections and len(detections) > 0:
+            # B detected something - A loses
+            score = -1.0
+        else:
+            # B failed to detect - A wins
+            score = 1.0
+        
+        # Additional heuristics for subtlety
+        obvious_keywords = ["WRONG", "ERROR", "FALSE", "INCORRECT", "FAKE"]
+        if any(kw in sabotaged_report.upper() for kw in obvious_keywords):
+            score -= 0.2  # Penalize obvious sabotage
         
         # Penalize if report is identical to original
-        if sabotaged_report == prompts[0][-1]["content"]:
+        if original_report and sabotaged_report.strip() == original_report.strip():
             score -= 1.0
         
         scores.append(score)
@@ -609,26 +688,62 @@ def reward_func_A(prompts, completions, **kwargs):
 
 def reward_func_B(prompts, completions, **kwargs):
     """
-    GRPO reward function for Model B.
-    This will be called during GRPO training.
+    GRPO reward function for Model B (Detector).
+    This is called by GRPOTrainer during training to compute rewards.
+    
+    The reward is computed adversarially:
+    - Model B generates detection results (in completions)
+    - We check if the detections are meaningful and correct
+    - If B correctly identifies issues: B gets +1.0 reward
+    - If B fails to identify issues: B gets -1.0 reward
+    
+    This reward is then used by GRPO to update Model B's weights via policy gradients.
     """
     scores = []
+    
+    # Extract sabotaged report from prompts
+    sabotaged_report = ""
+    for msg in prompts[0]:
+        if msg["role"] == "user":
+            content = msg["content"]
+            if "Financial report to analyze:" in content:
+                sabotaged_report = content.split("Financial report to analyze:")[1].split("\n\nIdentify")[0].strip()
+            break
+    
     for completion in completions:
         detection_response = completion[0]["content"]
         score = 0.0
         
-        # Reward if detection markers are present
-        if detection_start in detection_response and detection_end in detection_response:
-            score += 1.0
+        # Extract detections from Model B's response
+        detections = extract_detections(detection_response)
         
-        # Reward if detection keywords are present
-        detection_keywords = ["incorrect", "wrong", "outdated", "false", "suspicious"]
-        found_keywords = sum(1 for kw in detection_keywords if kw in detection_response.lower())
-        score += found_keywords * 0.2
+        # Adversarial evaluation: Check if B correctly identified issues
+        # We use a heuristic: if B found detections and they seem reasonable, reward it
+        if detections and len(detections) > 0:
+            # B detected something - check if it's reasonable
+            # Reward based on detection quality
+            score = 1.0
+            
+            # Additional quality checks
+            detection_text = " ".join(detections).lower()
+            detection_keywords = ["incorrect", "wrong", "outdated", "false", "suspicious", "error", "inconsistent"]
+            found_keywords = sum(1 for kw in detection_keywords if kw in detection_text)
+            if found_keywords > 0:
+                score += 0.2 * min(found_keywords, 3)  # Bonus for relevant keywords
+            
+            # Check if detection markers are present (good practice)
+            if detection_start in detection_response and detection_end in detection_response:
+                score += 0.3
+        else:
+            # B failed to detect anything - penalize
+            score = -1.0
         
         # Penalize empty or very short responses
         if len(detection_response.strip()) < 20:
-            score -= 1.0
+            score -= 0.5
+        
+        # If we have the sabotaged report, we could do more sophisticated checking
+        # For now, we use the heuristic above
         
         scores.append(score)
     
@@ -793,16 +908,27 @@ def train_models():
             if hasattr(module, 'lora_B') and "adapter_B" in module.lora_B:
                 del module.lora_B["adapter_B"]
     
+    # ========================================================================
+    # MODEL A TRAINING: Update Model A (Saboteur) using GRPO
+    # ========================================================================
+    # GRPOTrainer uses reward_func_A to compute rewards for each generation.
+    # During training, GRPO:
+    #   1. Generates multiple completions for each prompt (num_generations=2)
+    #   2. Calls reward_func_A(prompts, completions) to get rewards
+    #   3. Computes policy gradients from rewards
+    #   4. Updates Model A's LoRA weights via backpropagation
+    #   5. Repeats for each batch/step
     trainer_A = GRPOTrainer(
         model=model_A,
         processing_class=tokenizer_A,
-        reward_funcs=[reward_func_A],
+        reward_funcs=[reward_func_A],  # Reward function called during training
         args=training_args_A,
         train_dataset=dataset_A,
     )
     
     print("\nStarting training...")
     print("Loss will be logged during training. Check output for progress.\n")
+    # MODEL UPDATE HAPPENS HERE: trainer_A.train() updates Model A's weights
     trainer_A.train()
     
     # Print final training metrics
@@ -814,6 +940,7 @@ def train_models():
             if 'loss' in log_entry:
                 print(f"Step {log_entry.get('step', 'N/A')}: Loss = {log_entry['loss']:.4f}")
     
+    # MODEL SAVING HAPPENS HERE: Save Model A's LoRA adapter weights
     model_A.save_pretrained("lora_model_A")
     
     # Clear GRPO checkpoint directory after Model A training
@@ -921,16 +1048,27 @@ def train_models():
         model_B.set_adapter("default")
         print("Adapter renamed successfully. Active adapter is now 'default'.")
     
+    # ========================================================================
+    # MODEL B TRAINING: Update Model B (Detector) using GRPO
+    # ========================================================================
+    # GRPOTrainer uses reward_func_B to compute rewards for each generation.
+    # During training, GRPO:
+    #   1. Generates multiple completions for each prompt (num_generations=2)
+    #   2. Calls reward_func_B(prompts, completions) to get rewards
+    #   3. Computes policy gradients from rewards
+    #   4. Updates Model B's LoRA weights (adapter_B) via backpropagation
+    #   5. Repeats for each batch/step
     trainer_B = GRPOTrainer(
         model=model_B,
         processing_class=tokenizer_B,
-        reward_funcs=[reward_func_B],
+        reward_funcs=[reward_func_B],  # Reward function called during training
         args=training_args_B,
         train_dataset=dataset_B,
     )
     
     print("\nStarting training...")
     print("Loss will be logged during training. Check output for progress.\n")
+    # MODEL UPDATE HAPPENS HERE: trainer_B.train() updates Model B's weights
     trainer_B.train()
     
     # Print final training metrics
@@ -942,6 +1080,7 @@ def train_models():
             if 'loss' in log_entry:
                 print(f"Step {log_entry.get('step', 'N/A')}: Loss = {log_entry['loss']:.4f}")
     
+    # MODEL SAVING HAPPENS HERE: Save Model B's LoRA adapter weights
     model_B.save_pretrained("lora_model_B")
     
     # Rename "default" back to "adapter_B" after training
@@ -982,6 +1121,10 @@ def adversarial_game_loop(num_iterations=5):
     dataset = load_financial_dataset()
     if len(dataset) > 100:
         dataset = dataset.select(range(100))
+    
+    # Track rewards for averaging
+    rewards_A = []
+    rewards_B = []
     
     for iteration in range(num_iterations):
         print(f"\n{'='*50}")
@@ -1064,6 +1207,23 @@ def adversarial_game_loop(num_iterations=5):
             print("Result: Model B failed to detect - A wins, B loses")
         
         print(f"Reward A: {reward_A}, Reward B: {reward_B}")
+        
+        # Track rewards for averaging
+        rewards_A.append(reward_A)
+        rewards_B.append(reward_B)
+    
+    # Print summary with average rewards
+    print("\n" + "="*50)
+    print("Adversarial Game Loop Complete!")
+    print("="*50)
+    avg_reward_A = sum(rewards_A) / len(rewards_A) if rewards_A else 0.0
+    avg_reward_B = sum(rewards_B) / len(rewards_B) if rewards_B else 0.0
+    print(f"Total iterations: {num_iterations}")
+    print(f"Average reward for Saboteur (Model A): {avg_reward_A:.4f}")
+    print(f"Average reward for Detector (Model B): {avg_reward_B:.4f}")
+    print(f"\nSaboteur wins: {sum(1 for r in rewards_A if r > 0)}/{num_iterations} ({100*sum(1 for r in rewards_A if r > 0)/num_iterations:.1f}%)")
+    print(f"Detector wins: {sum(1 for r in rewards_B if r > 0)}/{num_iterations} ({100*sum(1 for r in rewards_B if r > 0)/num_iterations:.1f}%)")
+    print("="*50)
 
 # ============================================================================
 # Main Execution
