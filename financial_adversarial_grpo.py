@@ -188,6 +188,9 @@ import numpy as np
 import pandas as pd
 import torch
 import gc
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import matplotlib.pyplot as plt
 
 from datasets import load_dataset, Dataset
 
@@ -235,43 +238,133 @@ detection_end = "<DETECTION_END>"
 # Model Initialization
 # ============================================================================
 
-print("Initializing shared model with two LoRA adapters...")
+def load_or_initialize_models(load_model_A=False, load_model_B=False, 
+                               model_A_path="lora_model_A", model_B_path="lora_model_B"):
+    """
+    Load previously trained models or initialize new ones.
+    
+    Args:
+        load_model_A: Whether to load Model A from saved checkpoint
+        load_model_B: Whether to load Model B from saved checkpoint
+        model_A_path: Path to saved Model A checkpoint
+        model_B_path: Path to saved Model B checkpoint
+    
+    Returns:
+        base_model, tokenizer, default_adapter_name, model_A_loaded, model_B_loaded
+    """
+    model_A_loaded = False
+    model_B_loaded = False
+    
+    # Load base model once (shared between A and B)
+    print("Loading base model...")
+    base_model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=base_model_name,
+        max_seq_length=max_seq_length,
+        load_in_4bit=False,
+        fast_inference=False,  # Disabled due to vLLM 0.14.0 LoRA manager API incompatibility
+        max_lora_rank=lora_rank,
+        gpu_memory_utilization=0.4,  # Reduced to leave more room for GRPO generation
+    )
+    
+    # Try to load Model A if requested and exists
+    if load_model_A and os.path.exists(model_A_path):
+        print(f"\nLoading Model A (Saboteur) from {model_A_path}...")
+        try:
+            # Load the PEFT model with saved adapters
+            base_model = FastLanguageModel.from_pretrained(
+                model_name=base_model_name,
+                max_seq_length=max_seq_length,
+                load_in_4bit=False,
+                fast_inference=False,
+                max_lora_rank=lora_rank,
+                gpu_memory_utilization=0.4,
+            )
+            # Load the saved LoRA adapters
+            from peft import PeftModel
+            base_model = PeftModel.from_pretrained(base_model, model_A_path)
+            model_A_loaded = True
+            print(f"✓ Model A loaded successfully from {model_A_path}")
+        except Exception as e:
+            print(f"⚠ Warning: Failed to load Model A from {model_A_path}: {e}")
+            print("  Initializing new Model A adapter...")
+            model_A_loaded = False
+    
+    # If Model A not loaded, create new adapter
+    if not model_A_loaded:
+        print("\nInitializing new Model A (Saboteur) adapter...")
+        base_model = FastLanguageModel.get_peft_model(
+            base_model,
+            r=lora_rank,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            lora_alpha=lora_rank*2,
+            use_gradient_checkpointing="unsloth",
+            random_state=3407,
+        )
+    
+    # Get the default adapter name (usually "default" or the first adapter)
+    default_adapter_name = list(base_model.peft_config.keys())[0] if hasattr(base_model, 'peft_config') and base_model.peft_config else "default"
+    
+    # Try to load Model B if requested and exists
+    if load_model_B and os.path.exists(model_B_path):
+        print(f"\nLoading Model B (Detector) from {model_B_path}...")
+        try:
+            # Add adapter_B from saved checkpoint
+            from peft import PeftConfig
+            # Load adapter config
+            adapter_config_path = os.path.join(model_B_path, "adapter_config.json")
+            if os.path.exists(adapter_config_path):
+                import json
+                with open(adapter_config_path, 'r') as f:
+                    adapter_config_dict = json.load(f)
+                
+                from peft import LoraConfig
+                adapter_B_config = LoraConfig(
+                    r=adapter_config_dict.get("r", lora_rank),
+                    lora_alpha=adapter_config_dict.get("lora_alpha", lora_rank*2),
+                    target_modules=adapter_config_dict.get("target_modules", ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]),
+                    lora_dropout=adapter_config_dict.get("lora_dropout", 0.0),
+                    bias=adapter_config_dict.get("bias", "none"),
+                    task_type=adapter_config_dict.get("task_type", "CAUSAL_LM"),
+                )
+                
+                # Add adapter and load weights
+                base_model.add_adapter("adapter_B", adapter_B_config)
+                base_model.load_adapter(model_B_path, "adapter_B")
+                model_B_loaded = True
+                print(f"✓ Model B loaded successfully from {model_B_path}")
+            else:
+                print(f"⚠ Warning: adapter_config.json not found in {model_B_path}")
+                model_B_loaded = False
+        except Exception as e:
+            print(f"⚠ Warning: Failed to load Model B from {model_B_path}: {e}")
+            print("  Will add adapter_B during training if needed...")
+            model_B_loaded = False
+    
+    # Print summary
+    print("\n" + "="*50)
+    print("Model Initialization Summary:")
+    print("="*50)
+    print(f"Base model: {base_model_name}")
+    adapters = list(base_model.peft_config.keys()) if hasattr(base_model, 'peft_config') and base_model.peft_config else []
+    print(f"Loaded adapters: {adapters}")
+    print(f"Model A (Saboteur): {'✓ Loaded' if model_A_loaded else '✗ New'}")
+    print(f"Model B (Detector): {'✓ Loaded' if model_B_loaded else '✗ New (will be added during training)'}")
+    print("="*50 + "\n")
+    
+    # Setup chat templates
+    setup_chat_templates(tokenizer, tokenizer)
+    
+    return base_model, tokenizer, default_adapter_name, model_A_loaded, model_B_loaded
 
-# Load base model once (shared between A and B)
-# Note: fast_inference=False to avoid vLLM LoRA manager compatibility issues with vLLM 0.14.0
-base_model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name=base_model_name,
-    max_seq_length=max_seq_length,
-    load_in_4bit=False,
-    fast_inference=False,  # Disabled due to vLLM 0.14.0 LoRA manager API incompatibility
-    max_lora_rank=lora_rank,
-    gpu_memory_utilization=0.4,  # Reduced to leave more room for GRPO generation
-)
-
-# Add first LoRA adapter for Model A (Saboteur)
-# We'll add adapter_B later after training Model A to avoid vLLM LoRA loading issues
-base_model = FastLanguageModel.get_peft_model(
-    base_model,
-    r=lora_rank,
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-    lora_alpha=lora_rank*2,
-    use_gradient_checkpointing="unsloth",
-    random_state=3407,
-)
-
-# Get the default adapter name (usually "default" or the first adapter)
-default_adapter_name = list(base_model.peft_config.keys())[0] if hasattr(base_model, 'peft_config') and base_model.peft_config else "default"
-
-# Set up model references
-# Model A uses default adapter, Model B will use adapter_B (added after training A)
-model_A = base_model
-model_B = base_model  # Will be the same model, but adapter_B will be added later
-tokenizer_A = tokenizer
-tokenizer_B = tokenizer
-
-print("Shared model initialized:")
-print(f"  - Adapter '{default_adapter_name}': for Saboteur (Model A)")
-print(f"  - Adapter 'adapter_B': will be added after training Model A")
+# Initialize models (will be overridden if loading from checkpoints)
+# This is a placeholder - actual initialization happens in train_models() or adversarial_game_loop()
+base_model = None
+tokenizer = None
+default_adapter_name = "default"
+model_A = None
+model_B = None
+tokenizer_A = None
+tokenizer_B = None
 
 # ============================================================================
 # Chat Templates
@@ -315,7 +408,6 @@ chat_template_A = \
     "{% endfor %}"
 
 chat_template_A = chat_template_A.replace("'{system_prompt_A}'", f"'{system_prompt_A}'")
-tokenizer_A.chat_template = chat_template_A
 
 # Chat template for B
 chat_template_B = \
@@ -339,7 +431,11 @@ chat_template_B = \
 chat_template_B = chat_template_B\
     .replace("'{system_prompt_B}'", f"'{system_prompt_B}'")\
     .replace("'{detection_start}'", f"'{detection_start}'")
-tokenizer_B.chat_template = chat_template_B
+
+def setup_chat_templates(tokenizer_A, tokenizer_B):
+    """Setup chat templates for both tokenizers."""
+    tokenizer_A.chat_template = chat_template_A
+    tokenizer_B.chat_template = chat_template_B
 
 # ============================================================================
 # Dataset Loading and Preprocessing
@@ -541,6 +637,102 @@ def extract_detections(response):
             detections.append(sentence.strip())
     
     return detections
+
+# ============================================================================
+# Plotting Functions
+# ============================================================================
+
+def plot_rewards(rewards_A, rewards_B, output_dir="game_results", title="Rewards Over Time", 
+                 save_name="rewards_plot.png", iteration_numbers=None):
+    """
+    Plot rewards for Saboteur (Model A) and Detector (Model B).
+    
+    Args:
+        rewards_A: List of rewards for Model A (Saboteur)
+        rewards_B: List of rewards for Model B (Detector)
+        output_dir: Directory to save the plot
+        title: Plot title
+        save_name: Filename for saved plot
+        iteration_numbers: Optional list of iteration numbers (for x-axis)
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    if not rewards_A and not rewards_B:
+        print("No reward data to plot")
+        return
+    
+    # Create figure with subplots
+    fig, axes = plt.subplots(2, 1, figsize=(12, 10))
+    
+    # Prepare x-axis
+    if iteration_numbers is None:
+        x_axis = list(range(len(rewards_A) if rewards_A else len(rewards_B)))
+    else:
+        x_axis = iteration_numbers
+    
+    # Plot 1: Individual rewards over time
+    ax1 = axes[0]
+    if rewards_A:
+        ax1.plot(x_axis[:len(rewards_A)], rewards_A, 'r-', label='Saboteur (Model A)', alpha=0.7, linewidth=1.5)
+        ax1.scatter(x_axis[:len(rewards_A)], rewards_A, c='red', s=20, alpha=0.5)
+    if rewards_B:
+        ax1.plot(x_axis[:len(rewards_B)], rewards_B, 'b-', label='Detector (Model B)', alpha=0.7, linewidth=1.5)
+        ax1.scatter(x_axis[:len(rewards_B)], rewards_B, c='blue', s=20, alpha=0.5)
+    
+    ax1.axhline(y=0, color='gray', linestyle='--', linewidth=0.5)
+    ax1.set_xlabel('Iteration/Example', fontsize=12)
+    ax1.set_ylabel('Reward', fontsize=12)
+    ax1.set_title(f'{title} - Individual Rewards', fontsize=14, fontweight='bold')
+    ax1.legend(loc='best', fontsize=10)
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot 2: Moving average rewards
+    ax2 = axes[1]
+    window_size = max(5, len(rewards_A) // 20) if rewards_A else max(5, len(rewards_B) // 20)
+    window_size = min(window_size, 50)  # Cap at 50
+    
+    if rewards_A and len(rewards_A) >= window_size:
+        moving_avg_A = pd.Series(rewards_A).rolling(window=window_size, min_periods=1).mean()
+        ax2.plot(x_axis[:len(rewards_A)], moving_avg_A, 'r-', label=f'Saboteur (Model A) - {window_size}-point MA', 
+                linewidth=2, alpha=0.8)
+    
+    if rewards_B and len(rewards_B) >= window_size:
+        moving_avg_B = pd.Series(rewards_B).rolling(window=window_size, min_periods=1).mean()
+        ax2.plot(x_axis[:len(rewards_B)], moving_avg_B, 'b-', label=f'Detector (Model B) - {window_size}-point MA', 
+                linewidth=2, alpha=0.8)
+    
+    ax2.axhline(y=0, color='gray', linestyle='--', linewidth=0.5)
+    ax2.set_xlabel('Iteration/Example', fontsize=12)
+    ax2.set_ylabel('Moving Average Reward', fontsize=12)
+    ax2.set_title(f'{title} - Moving Average ({window_size}-point window)', fontsize=14, fontweight='bold')
+    ax2.legend(loc='best', fontsize=10)
+    ax2.grid(True, alpha=0.3)
+    
+    # Add statistics text box
+    stats_text = []
+    if rewards_A:
+        avg_A = np.mean(rewards_A)
+        std_A = np.std(rewards_A)
+        wins_A = sum(1 for r in rewards_A if r > 0)
+        stats_text.append(f'Saboteur: Avg={avg_A:.3f}, Std={std_A:.3f}, Wins={wins_A}/{len(rewards_A)}')
+    if rewards_B:
+        avg_B = np.mean(rewards_B)
+        std_B = np.std(rewards_B)
+        wins_B = sum(1 for r in rewards_B if r > 0)
+        stats_text.append(f'Detector: Avg={avg_B:.3f}, Std={std_B:.3f}, Wins={wins_B}/{len(rewards_B)}')
+    
+    if stats_text:
+        fig.text(0.5, 0.02, ' | '.join(stats_text), ha='center', fontsize=9, 
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    plt.tight_layout()
+    
+    # Save plot
+    plot_path = os.path.join(output_dir, save_name)
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    print(f"\nReward plot saved to: {plot_path}")
+    
+    plt.close()
 
 # ============================================================================
 # Reward Functions
@@ -795,8 +987,36 @@ def prepare_dataset_for_B(dataset):
     formatted = formatted.filter(lambda x: x["prompt"] is not None)
     return formatted
 
-def train_models():
-    """Main training function for both models."""
+def train_models(load_model_A=False, load_model_B=False, 
+                 model_A_path="lora_model_A", model_B_path="lora_model_B",
+                 resume_training_A=False, resume_training_B=False):
+    """
+    Main training function for both models.
+    
+    Args:
+        load_model_A: Load Model A from checkpoint before training
+        load_model_B: Load Model B from checkpoint before training
+        model_A_path: Path to Model A checkpoint
+        model_B_path: Path to Model B checkpoint
+        resume_training_A: Resume training Model A (requires load_model_A=True)
+        resume_training_B: Resume training Model B (requires load_model_B=True)
+    """
+    global base_model, tokenizer, default_adapter_name, model_A, model_B, tokenizer_A, tokenizer_B
+    
+    # Initialize or load models
+    base_model, tokenizer, default_adapter_name, model_A_loaded, model_B_loaded = load_or_initialize_models(
+        load_model_A=load_model_A,
+        load_model_B=load_model_B,
+        model_A_path=model_A_path,
+        model_B_path=model_B_path
+    )
+    
+    # Set up model references
+    model_A = base_model
+    model_B = base_model
+    tokenizer_A = tokenizer
+    tokenizer_B = tokenizer
+    
     print("Loading dataset...")
     dataset = load_financial_dataset()
     
@@ -805,6 +1025,10 @@ def train_models():
         dataset = dataset.select(range(1000))
     
     print(f"Dataset size: {len(dataset)}")
+    
+    # Track rewards during training
+    training_rewards_A = []
+    training_rewards_B = []
     
     # Prepare datasets
     print("Preparing datasets...")
@@ -920,10 +1144,17 @@ def train_models():
     #   3. Computes policy gradients from rewards
     #   4. Updates Model A's LoRA weights via backpropagation
     #   5. Repeats for each batch/step
+    
+    # Create wrapper to track rewards
+    def reward_func_A_tracked(prompts, completions, **kwargs):
+        rewards = reward_func_A(prompts, completions, **kwargs)
+        training_rewards_A.extend(rewards)  # Track rewards
+        return rewards
+    
     trainer_A = GRPOTrainer(
         model=model_A,
         processing_class=tokenizer_A,
-        reward_funcs=[reward_func_A],  # Reward function called during training
+        reward_funcs=[reward_func_A_tracked],  # Reward function with tracking
         args=training_args_A,
         train_dataset=dataset_A,
     )
@@ -951,18 +1182,22 @@ def train_models():
         print("Cleared GRPO checkpoint directory after Model A training")
     
     # Now add adapter_B for Model B training (after Model A is trained)
-    print("\nAdding adapter_B for Model B training...")
-    from peft import LoraConfig
-    lora_config_B = LoraConfig(
-        r=lora_rank,
-        lora_alpha=lora_rank*2,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        lora_dropout=0.0,
-        bias="none",
-        task_type="CAUSAL_LM",
-    )
-    model_B.add_adapter("adapter_B", lora_config_B)
-    print("Adapter_B added successfully.")
+    # Check if adapter_B already exists (loaded from checkpoint)
+    if "adapter_B" not in (model_B.peft_config.keys() if hasattr(model_B, 'peft_config') and model_B.peft_config else []):
+        print("\nAdding adapter_B for Model B training...")
+        from peft import LoraConfig
+        lora_config_B = LoraConfig(
+            r=lora_rank,
+            lora_alpha=lora_rank*2,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            lora_dropout=0.0,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model_B.add_adapter("adapter_B", lora_config_B)
+        print("Adapter_B added successfully.")
+    else:
+        print("\nAdapter_B already exists (loaded from checkpoint).")
     
     # Train Model B
     print("\n" + "="*50)
@@ -1060,10 +1295,17 @@ def train_models():
     #   3. Computes policy gradients from rewards
     #   4. Updates Model B's LoRA weights (adapter_B) via backpropagation
     #   5. Repeats for each batch/step
+    
+    # Create wrapper to track rewards
+    def reward_func_B_tracked(prompts, completions, **kwargs):
+        rewards = reward_func_B(prompts, completions, **kwargs)
+        training_rewards_B.extend(rewards)  # Track rewards
+        return rewards
+    
     trainer_B = GRPOTrainer(
         model=model_B,
         processing_class=tokenizer_B,
-        reward_funcs=[reward_func_B],  # Reward function called during training
+        reward_funcs=[reward_func_B_tracked],  # Reward function with tracking
         args=training_args_B,
         train_dataset=dataset_B,
     )
@@ -1109,6 +1351,17 @@ def train_models():
     print("\nTraining complete!")
     print("Model A saved to: lora_model_A")
     print("Model B saved to: lora_model_B")
+    
+    # Plot training rewards
+    if training_rewards_A or training_rewards_B:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        plot_rewards(
+            training_rewards_A,
+            training_rewards_B,
+            output_dir="outputs",
+            title="GRPO Training Rewards",
+            save_name=f"training_rewards_{timestamp}.png"
+        )
 
 # ============================================================================
 # Adversarial Game Loop (for iterative improvement)
@@ -1116,7 +1369,9 @@ def train_models():
 
 def adversarial_game_loop(num_iterations=5, batch_size=8, output_dir="game_results", 
                           update_model_B=True, update_model_A=False, 
-                          training_frequency=1, num_training_steps=1):
+                          training_frequency=1, num_training_steps=1,
+                          load_model_A=False, load_model_B=False,
+                          model_A_path="lora_model_A", model_B_path="lora_model_B"):
     """
     Run adversarial game loop where A and B compete iteratively.
     Now processes examples in batches for efficiency and can update models using GRPO.
@@ -1129,7 +1384,26 @@ def adversarial_game_loop(num_iterations=5, batch_size=8, output_dir="game_resul
         update_model_A: Whether to update Model A (Saboteur) using GRPO (default: False)
         training_frequency: Update models every N iterations (default: 1 = every iteration)
         num_training_steps: Number of GRPO training steps per update (default: 1)
+        load_model_A: Load Model A from checkpoint before game loop
+        load_model_B: Load Model B from checkpoint before game loop
+        model_A_path: Path to Model A checkpoint
+        model_B_path: Path to Model B checkpoint
     """
+    global base_model, tokenizer, default_adapter_name, model_A, model_B, tokenizer_A, tokenizer_B
+    
+    # Initialize or load models if not already initialized
+    if model_A is None or model_B is None:
+        base_model, tokenizer, default_adapter_name, model_A_loaded, model_B_loaded = load_or_initialize_models(
+            load_model_A=load_model_A,
+            load_model_B=load_model_B,
+            model_A_path=model_A_path,
+            model_B_path=model_B_path
+        )
+        model_A = base_model
+        model_B = base_model
+        tokenizer_A = tokenizer
+        tokenizer_B = tokenizer
+    
     print("Starting adversarial game loop...")
     print(f"Batch size: {batch_size} examples per iteration")
     print(f"Update Model A (Saboteur): {update_model_A}")
@@ -1619,6 +1893,16 @@ def adversarial_game_loop(num_iterations=5, batch_size=8, output_dir="game_resul
     print(f"  - {len(all_results)} examples with full details")
     print(f"  - Original reports, sabotaged reports, detections, and rewards")
     print(f"  - Use these files to review model performance and improvements")
+    
+    # Plot rewards
+    if rewards_A or rewards_B:
+        plot_rewards(
+            rewards_A, 
+            rewards_B, 
+            output_dir=output_dir,
+            title="Adversarial Game Loop Rewards",
+            save_name=f"rewards_plot_{timestamp}.png"
+        )
 
 # ============================================================================
 # Main Execution
@@ -1646,11 +1930,30 @@ if __name__ == "__main__":
                         help="Update models every N iterations (default: 1 = every iteration)")
     parser.add_argument("--num_training_steps", type=int, default=1,
                         help="Number of GRPO training steps per update (default: 1)")
+    parser.add_argument("--load_model_A", action="store_true", default=False,
+                        help="Load Model A (Saboteur) from checkpoint before training/game")
+    parser.add_argument("--load_model_B", action="store_true", default=False,
+                        help="Load Model B (Detector) from checkpoint before training/game")
+    parser.add_argument("--model_A_path", type=str, default="lora_model_A",
+                        help="Path to Model A checkpoint directory (default: lora_model_A)")
+    parser.add_argument("--model_B_path", type=str, default="lora_model_B",
+                        help="Path to Model B checkpoint directory (default: lora_model_B)")
+    parser.add_argument("--resume_training_A", action="store_true", default=False,
+                        help="Resume training Model A (requires --load_model_A)")
+    parser.add_argument("--resume_training_B", action="store_true", default=False,
+                        help="Resume training Model B (requires --load_model_B)")
     
     args = parser.parse_args()
     
     if args.mode in ["train", "both"]:
-        train_models()
+        train_models(
+            load_model_A=args.load_model_A,
+            load_model_B=args.load_model_B,
+            model_A_path=args.model_A_path,
+            model_B_path=args.model_B_path,
+            resume_training_A=args.resume_training_A,
+            resume_training_B=args.resume_training_B,
+        )
     
     if args.mode in ["game", "both"]:
         adversarial_game_loop(
@@ -1661,6 +1964,10 @@ if __name__ == "__main__":
             update_model_A=args.update_model_A,
             training_frequency=args.training_frequency,
             num_training_steps=args.num_training_steps,
+            load_model_A=args.load_model_A,
+            load_model_B=args.load_model_B,
+            model_A_path=args.model_A_path,
+            model_B_path=args.model_B_path,
         )
 
     # Clean up distributed process group to avoid NCCL warning on exit
