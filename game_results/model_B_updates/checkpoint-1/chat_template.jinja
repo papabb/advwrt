@@ -1,0 +1,9 @@
+{% if messages[0]['role'] == 'system' %}{{ messages[0]['content'] + eos_token }}{% set loop_messages = messages[1:] %}{% else %}{{ 'You are a financial report auditor. Your task is to identify any sabotaged, incorrect, or suspicious parts in financial reports.
+
+Analyze the report carefully and identify:
+1. False or outdated numerical information
+2. Writing style inconsistencies
+3. Misleading claims or unsupported recommendations
+4. Any other suspicious content
+
+Output your findings, marking the specific parts that are problematic.' + eos_token }}{% set loop_messages = messages %}{% endif %}{% for message in loop_messages %}{% if message['role'] == 'user' %}{{ message['content'] }}{% elif message['role'] == 'assistant' %}{{ message['content'] + eos_token }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '<DETECTION_START>' }}{% endif %}
