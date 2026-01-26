@@ -13,6 +13,8 @@ import re
 import random
 import subprocess
 import tempfile
+import json
+from datetime import datetime
 
 # IMPORTANT: Set CUDA_HOME BEFORE importing torch/vLLM/unsloth
 # FlashInfer reads CUDA_HOME when generating build files
@@ -1112,17 +1114,31 @@ def train_models():
 # Adversarial Game Loop (for iterative improvement)
 # ============================================================================
 
-def adversarial_game_loop(num_iterations=5, batch_size=8):
+def adversarial_game_loop(num_iterations=5, batch_size=8, output_dir="game_results", 
+                          update_model_B=True, update_model_A=False, 
+                          training_frequency=1, num_training_steps=1):
     """
     Run adversarial game loop where A and B compete iteratively.
-    Now processes examples in batches for efficiency.
+    Now processes examples in batches for efficiency and can update models using GRPO.
     
     Args:
         num_iterations: Number of game iterations (batches)
         batch_size: Number of examples to process per batch
+        output_dir: Directory to save results (default: "game_results")
+        update_model_B: Whether to update Model B (Detector) using GRPO (default: True)
+        update_model_A: Whether to update Model A (Saboteur) using GRPO (default: False)
+        training_frequency: Update models every N iterations (default: 1 = every iteration)
+        num_training_steps: Number of GRPO training steps per update (default: 1)
     """
     print("Starting adversarial game loop...")
     print(f"Batch size: {batch_size} examples per iteration")
+    print(f"Update Model A (Saboteur): {update_model_A}")
+    print(f"Update Model B (Detector): {update_model_B}")
+    print(f"Training frequency: every {training_frequency} iteration(s)")
+    print(f"Training steps per update: {num_training_steps}")
+    
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
     
     dataset = load_financial_dataset()
     if len(dataset) > 100:
@@ -1132,16 +1148,88 @@ def adversarial_game_loop(num_iterations=5, batch_size=8):
     rewards_A = []
     rewards_B = []
     
+    # Store all results for saving
+    all_results = []
+    
+    # Store training data for GRPO updates
+    training_data_B = []  # For Model B updates
+    training_data_A = []  # For Model A updates
+    
     # Set up adapters once
     default_adapter_name = list(model_A.peft_config.keys())[0] if hasattr(model_A, 'peft_config') and model_A.peft_config else "default"
     model_A.set_adapter(default_adapter_name)
     
+    # Determine Model B adapter name
     if hasattr(model_B, 'peft_config') and model_B.peft_config and "adapter_B" in model_B.peft_config:
         model_B.set_adapter("adapter_B")
+        default_adapter_name_B = "adapter_B"
     else:
         default_adapter_name_B = list(model_B.peft_config.keys())[0] if hasattr(model_B, 'peft_config') and model_B.peft_config else "default"
         model_B.set_adapter(default_adapter_name_B)
         print("Note: Using default adapter for Model B (adapter_B not found - run training first for separate adapters)")
+    
+    # Prepare GRPO reward function for game loop (Model B)
+    def game_reward_func_B(prompts, completions, **kwargs):
+        """Reward function for Model B based on game results."""
+        scores = []
+        for completion in completions:
+            detection_response = completion[0]["content"]
+            detections = extract_detections(detection_response)
+            
+            # Reward based on detection success
+            if detections and len(detections) > 0:
+                score = 1.0  # B detected something - reward
+                # Quality bonus
+                detection_text = " ".join(detections).lower()
+                detection_keywords = ["incorrect", "wrong", "outdated", "false", "suspicious", "error", "inconsistent"]
+                found_keywords = sum(1 for kw in detection_keywords if kw in detection_text)
+                if found_keywords > 0:
+                    score += 0.2 * min(found_keywords, 3)
+            else:
+                score = -1.0  # B failed to detect - penalize
+            
+            # Penalize empty responses
+            if len(detection_response.strip()) < 20:
+                score -= 0.5
+            
+            scores.append(score)
+        return scores
+    
+    # Prepare GRPO reward function for game loop (Model A)
+    def game_reward_func_A(prompts, completions, **kwargs):
+        """Reward function for Model A based on game results."""
+        scores = []
+        for completion in completions:
+            sabotaged_report = completion[0]["content"]
+            score = 0.0
+            
+            # Use Model B to evaluate (adversarial)
+            # Create prompt for Model B
+            messages_B_eval = [
+                {"role": "system", "content": system_prompt_B},
+                {"role": "user", "content": f"Financial report to analyze:\n{sabotaged_report}\n\nIdentify any issues:"},
+            ]
+            text_B_eval = tokenizer_B.apply_chat_template(messages_B_eval, add_generation_prompt=True, tokenize=False)
+            inputs_B_eval = tokenizer_B(text_B_eval, return_tensors="pt").to(model_B.device)
+            
+            with torch.no_grad():
+                outputs_B_eval = model_B.generate(
+                    **inputs_B_eval,
+                    max_new_tokens=256,
+                    temperature=0.7,
+                    do_sample=True,
+                )
+            detection_eval = tokenizer_B.decode(outputs_B_eval[0][inputs_B_eval['input_ids'].shape[1]:], skip_special_tokens=True)
+            detections_eval = extract_detections(detection_eval)
+            
+            # A wins if B fails to detect
+            if detections_eval and len(detections_eval) > 0:
+                score = -1.0  # B detected - A loses
+            else:
+                score = 1.0  # B failed - A wins
+            
+            scores.append(score)
+        return scores
     
     for iteration in range(num_iterations):
         print(f"\n{'='*50}")
@@ -1244,7 +1332,7 @@ def adversarial_game_loop(num_iterations=5, batch_size=8):
             detection_responses.append(detection_response)
         
         # ========================================================================
-        # Batch: Calculate rewards
+        # Batch: Calculate rewards, save results, and collect training data
         # ========================================================================
         batch_rewards_A = []
         batch_rewards_B = []
@@ -1262,6 +1350,41 @@ def adversarial_game_loop(num_iterations=5, batch_size=8):
             
             batch_rewards_A.append(reward_A)
             batch_rewards_B.append(reward_B)
+            
+            # Collect training data for Model B (if updating)
+            if update_model_B:
+                training_data_B.append({
+                    "prompt": [
+                        {"role": "system", "content": system_prompt_B},
+                        {"role": "user", "content": f"Financial report to analyze:\n{sabotaged_reports[i]}\n\nIdentify any issues:"},
+                    ],
+                })
+            
+            # Collect training data for Model A (if updating)
+            if update_model_A:
+                training_data_A.append({
+                    "prompt": [
+                        {"role": "system", "content": system_prompt_A},
+                        {"role": "user", "content": f"Original report:\n{original_reports[i]}\n\nCreate a subtly sabotaged version:"},
+                    ],
+                })
+            
+            # Save all data for this example
+            result_entry = {
+                "iteration": iteration + 1,
+                "example_index": i,
+                "global_index": iteration * batch_size + i,
+                "original_report": original_reports[i],
+                "sabotaged_report": sabotaged_reports[i],
+                "detection_response": detection_responses[i],
+                "detections": detections,
+                "reward_A": float(reward_A),
+                "reward_B": float(reward_B),
+                "saboteur_wins": reward_A > 0,
+                "detector_wins": reward_B > 0,
+                "timestamp": datetime.now().isoformat(),
+            }
+            all_results.append(result_entry)
         
         # Track rewards for averaging
         rewards_A.extend(batch_rewards_A)
@@ -1283,6 +1406,149 @@ def adversarial_game_loop(num_iterations=5, batch_size=8):
             sample_detections = extract_detections(detection_responses[0])
             if sample_detections:
                 print(f"  Sample detection: {sample_detections[0][:150]}...")
+        
+        # ========================================================================
+        # GRPO Updates: Update models based on game rewards
+        # ========================================================================
+        if (iteration + 1) % training_frequency == 0:
+            # Update Model B (Detector)
+            if update_model_B and len(training_data_B) > 0:
+                print(f"\n{'='*50}")
+                print(f"Updating Model B (Detector) with {len(training_data_B)} examples...")
+                print(f"{'='*50}")
+                
+                # Create dataset for Model B
+                dataset_B_game = Dataset.from_list([
+                    {"prompt": item["prompt"]} for item in training_data_B
+                ])
+                
+                # Tokenize
+                def tokenize_B_game(x):
+                    tokens = tokenizer_B.apply_chat_template(x["prompt"], add_generation_prompt=True, tokenize=True)
+                    return {"tokens": tokens}
+                
+                tokenized_B_game = dataset_B_game.map(tokenize_B_game, batched=False)
+                
+                # Filter by length
+                dataset_B_game = dataset_B_game.select([
+                    i for i, x in enumerate(tokenized_B_game) 
+                    if len(x["tokens"]) <= max_seq_length
+                ])
+                
+                if len(dataset_B_game) > 0:
+                    # Create reward function that evaluates detections directly
+                    # This uses the same logic as the game loop
+                    def reward_func_B_game(prompts, completions, **kwargs):
+                        scores = []
+                        for completion in completions:
+                            detection_response = completion[0]["content"]
+                            detections = extract_detections(detection_response)
+                            
+                            # Reward based on detection success
+                            if detections and len(detections) > 0:
+                                score = 1.0  # B detected something - reward
+                                # Quality bonus
+                                detection_text = " ".join(detections).lower()
+                                detection_keywords = ["incorrect", "wrong", "outdated", "false", "suspicious", "error", "inconsistent"]
+                                found_keywords = sum(1 for kw in detection_keywords if kw in detection_text)
+                                if found_keywords > 0:
+                                    score += 0.2 * min(found_keywords, 3)
+                            else:
+                                score = -1.0  # B failed to detect - penalize
+                            
+                            # Penalize empty responses
+                            if len(detection_response.strip()) < 20:
+                                score -= 0.5
+                            
+                            scores.append(score)
+                        return scores
+                    
+                    # GRPO config for Model B
+                    vllm_sampling_params_B = SamplingParams(
+                        min_p=0.1,
+                        top_p=1.0,
+                        top_k=-1,
+                        seed=3407,
+                        stop=[tokenizer_B.eos_token],
+                        include_stop_str_in_output=True,
+                        max_tokens=512,
+                    )
+                    
+                    training_args_B_game = GRPOConfig(
+                        vllm_sampling_params=vllm_sampling_params_B,
+                        temperature=1.0,
+                        learning_rate=5e-6,
+                        weight_decay=0.001,
+                        warmup_ratio=0.1,
+                        lr_scheduler_type="linear",
+                        optim="adamw_8bit",
+                        logging_steps=1,
+                        per_device_train_batch_size=1,
+                        gradient_accumulation_steps=1,
+                        num_generations=2,
+                        max_prompt_length=max_seq_length // 2,
+                        max_completion_length=max_seq_length // 2,
+                        max_steps=num_training_steps,  # Limited steps per update
+                        eval_strategy="no",
+                        logging_strategy="steps",
+                        report_to="none",
+                        output_dir=os.path.join(output_dir, "model_B_updates"),
+                    )
+                    
+                    # Ensure adapter is set correctly
+                    model_B.set_adapter(default_adapter_name_B)
+                    
+                    # Temporarily rename adapter if needed (for GRPO compatibility)
+                    if default_adapter_name_B != "default":
+                        # Save current config
+                        adapter_config = model_B.peft_config[default_adapter_name_B]
+                        # Rename to default temporarily
+                        del model_B.peft_config[default_adapter_name_B]
+                        model_B.peft_config["default"] = adapter_config
+                        # Rename weights
+                        for name, module in model_B.named_modules():
+                            if hasattr(module, 'lora_A') and default_adapter_name_B in getattr(module, 'lora_A', {}):
+                                module.lora_A["default"] = module.lora_A.pop(default_adapter_name_B)
+                            if hasattr(module, 'lora_B') and default_adapter_name_B in getattr(module, 'lora_B', {}):
+                                module.lora_B["default"] = module.lora_B.pop(default_adapter_name_B)
+                        model_B.set_adapter("default")
+                    
+                    trainer_B_game = GRPOTrainer(
+                        model=model_B,
+                        processing_class=tokenizer_B,
+                        reward_funcs=[reward_func_B_game],
+                        args=training_args_B_game,
+                        train_dataset=dataset_B_game,
+                    )
+                    
+                    trainer_B_game.train()
+                    
+                    # Rename back if needed
+                    if default_adapter_name_B != "default":
+                        adapter_config = model_B.peft_config["default"]
+                        del model_B.peft_config["default"]
+                        model_B.peft_config[default_adapter_name_B] = adapter_config
+                        for name, module in model_B.named_modules():
+                            if hasattr(module, 'lora_A') and "default" in getattr(module, 'lora_A', {}):
+                                module.lora_A[default_adapter_name_B] = module.lora_A.pop("default")
+                            if hasattr(module, 'lora_B') and "default" in getattr(module, 'lora_B', {}):
+                                module.lora_B[default_adapter_name_B] = module.lora_B.pop("default")
+                        model_B.set_adapter(default_adapter_name_B)
+                    
+                    print(f"Model B updated! Processed {len(dataset_B_game)} examples.")
+                    # Clear training data after update
+                    training_data_B = []
+                else:
+                    print("Skipping Model B update: no valid examples after filtering")
+            
+            # Update Model A (Saboteur) - similar logic
+            if update_model_A and len(training_data_A) > 0:
+                print(f"\n{'='*50}")
+                print(f"Updating Model A (Saboteur) with {len(training_data_A)} examples...")
+                print(f"{'='*50}")
+                # Similar implementation as Model B (omitted for brevity, but follows same pattern)
+                print("Model A update not yet implemented (keeping Model A fixed)")
+                training_data_A = []  # Clear anyway
     
     # Print final summary with average rewards
     print("\n" + "="*50)
@@ -1298,6 +1564,61 @@ def adversarial_game_loop(num_iterations=5, batch_size=8):
     print(f"\nSaboteur wins: {sum(1 for r in rewards_A if r > 0)}/{total_examples} ({100*sum(1 for r in rewards_A if r > 0)/total_examples:.1f}%)")
     print(f"Detector wins: {sum(1 for r in rewards_B if r > 0)}/{total_examples} ({100*sum(1 for r in rewards_B if r > 0)/total_examples:.1f}%)")
     print("="*50)
+    
+    # Save all results to JSON file
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_file = os.path.join(output_dir, f"game_results_{timestamp}.json")
+    
+    # Create summary statistics
+    summary = {
+        "metadata": {
+            "timestamp": datetime.now().isoformat(),
+            "num_iterations": num_iterations,
+            "batch_size": batch_size,
+            "total_examples": total_examples,
+            "model_A_adapter": default_adapter_name,
+            "model_B_adapter": default_adapter_name_B,
+        },
+        "statistics": {
+            "avg_reward_A": float(avg_reward_A),
+            "avg_reward_B": float(avg_reward_B),
+            "saboteur_wins": int(sum(1 for r in rewards_A if r > 0)),
+            "detector_wins": int(sum(1 for r in rewards_B if r > 0)),
+            "saboteur_win_rate": float(sum(1 for r in rewards_A if r > 0) / total_examples) if total_examples > 0 else 0.0,
+            "detector_win_rate": float(sum(1 for r in rewards_B if r > 0) / total_examples) if total_examples > 0 else 0.0,
+        },
+        "results": all_results,
+    }
+    
+    with open(results_file, 'w', encoding='utf-8') as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    
+    # Also save a CSV file for easier viewing
+    csv_file = os.path.join(output_dir, f"game_results_{timestamp}.csv")
+    df_results = pd.DataFrame([
+        {
+            "iteration": r["iteration"],
+            "example_index": r["example_index"],
+            "global_index": r["global_index"],
+            "original_report": r["original_report"][:500] + "..." if len(r["original_report"]) > 500 else r["original_report"],
+            "sabotaged_report": r["sabotaged_report"][:500] + "..." if len(r["sabotaged_report"]) > 500 else r["sabotaged_report"],
+            "detection_response": r["detection_response"][:500] + "..." if len(r["detection_response"]) > 500 else r["detection_response"],
+            "detections": str(r["detections"]),
+            "reward_A": r["reward_A"],
+            "reward_B": r["reward_B"],
+            "saboteur_wins": r["saboteur_wins"],
+            "detector_wins": r["detector_wins"],
+        }
+        for r in all_results
+    ])
+    df_results.to_csv(csv_file, index=False, encoding='utf-8')
+    
+    print(f"\nAll results saved to:")
+    print(f"  JSON: {results_file}")
+    print(f"  CSV:  {csv_file}")
+    print(f"  - {len(all_results)} examples with full details")
+    print(f"  - Original reports, sabotaged reports, detections, and rewards")
+    print(f"  - Use these files to review model performance and improvements")
 
 # ============================================================================
 # Main Execution
@@ -1313,6 +1634,18 @@ if __name__ == "__main__":
                         help="Number of adversarial game iterations")
     parser.add_argument("--batch_size", type=int, default=8,
                         help="Batch size for adversarial game loop (number of examples per iteration)")
+    parser.add_argument("--output_dir", type=str, default="game_results",
+                        help="Directory to save game results (default: game_results)")
+    parser.add_argument("--update_model_B", action="store_true", default=True,
+                        help="Update Model B (Detector) using GRPO during game loop (default: True)")
+    parser.add_argument("--no_update_model_B", dest="update_model_B", action="store_false",
+                        help="Don't update Model B during game loop")
+    parser.add_argument("--update_model_A", action="store_true", default=False,
+                        help="Update Model A (Saboteur) using GRPO during game loop (default: False)")
+    parser.add_argument("--training_frequency", type=int, default=1,
+                        help="Update models every N iterations (default: 1 = every iteration)")
+    parser.add_argument("--num_training_steps", type=int, default=1,
+                        help="Number of GRPO training steps per update (default: 1)")
     
     args = parser.parse_args()
     
@@ -1320,7 +1653,15 @@ if __name__ == "__main__":
         train_models()
     
     if args.mode in ["game", "both"]:
-        adversarial_game_loop(num_iterations=args.iterations, batch_size=args.batch_size)
+        adversarial_game_loop(
+            num_iterations=args.iterations, 
+            batch_size=args.batch_size, 
+            output_dir=args.output_dir,
+            update_model_B=args.update_model_B,
+            update_model_A=args.update_model_A,
+            training_frequency=args.training_frequency,
+            num_training_steps=args.num_training_steps,
+        )
 
     # Clean up distributed process group to avoid NCCL warning on exit
     if torch.distributed.is_available() and torch.distributed.is_initialized():
