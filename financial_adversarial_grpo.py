@@ -1112,11 +1112,17 @@ def train_models():
 # Adversarial Game Loop (for iterative improvement)
 # ============================================================================
 
-def adversarial_game_loop(num_iterations=5):
+def adversarial_game_loop(num_iterations=5, batch_size=8):
     """
     Run adversarial game loop where A and B compete iteratively.
+    Now processes examples in batches for efficiency.
+    
+    Args:
+        num_iterations: Number of game iterations (batches)
+        batch_size: Number of examples to process per batch
     """
     print("Starting adversarial game loop...")
+    print(f"Batch size: {batch_size} examples per iteration")
     
     dataset = load_financial_dataset()
     if len(dataset) > 100:
@@ -1126,103 +1132,171 @@ def adversarial_game_loop(num_iterations=5):
     rewards_A = []
     rewards_B = []
     
+    # Set up adapters once
+    default_adapter_name = list(model_A.peft_config.keys())[0] if hasattr(model_A, 'peft_config') and model_A.peft_config else "default"
+    model_A.set_adapter(default_adapter_name)
+    
+    if hasattr(model_B, 'peft_config') and model_B.peft_config and "adapter_B" in model_B.peft_config:
+        model_B.set_adapter("adapter_B")
+    else:
+        default_adapter_name_B = list(model_B.peft_config.keys())[0] if hasattr(model_B, 'peft_config') and model_B.peft_config else "default"
+        model_B.set_adapter(default_adapter_name_B)
+        print("Note: Using default adapter for Model B (adapter_B not found - run training first for separate adapters)")
+    
     for iteration in range(num_iterations):
         print(f"\n{'='*50}")
-        print(f"Iteration {iteration + 1}/{num_iterations}")
+        print(f"Iteration {iteration + 1}/{num_iterations} (processing {batch_size} examples)")
         print(f"{'='*50}")
         
-        # Sample a report
-        sample = dataset[random.randint(0, len(dataset) - 1)]
-        original_report = sample.get("report", sample.get("text", ""))
+        # Sample batch of reports
+        batch_indices = [random.randint(0, len(dataset) - 1) for _ in range(batch_size)]
+        batch_samples = [dataset[idx] for idx in batch_indices]
+        original_reports = [sample.get("report", sample.get("text", "")) for sample in batch_samples]
         
-        # Model A creates sabotaged version
-        print("\nModel A (Saboteur) creating sabotaged report...")
-        messages_A = [
-            {"role": "system", "content": system_prompt_A},
-            {"role": "user", "content": f"Original report:\n{original_report}\n\nCreate a subtly sabotaged version:"},
-        ]
+        # ========================================================================
+        # Batch: Model A creates sabotaged versions
+        # ========================================================================
+        print(f"\nModel A (Saboteur) creating {batch_size} sabotaged reports (batched)...")
         
-        text_A = tokenizer_A.apply_chat_template(messages_A, add_generation_prompt=True, tokenize=False)
+        # Prepare batch of prompts for Model A
+        texts_A = []
+        for original_report in original_reports:
+            messages_A = [
+                {"role": "system", "content": system_prompt_A},
+                {"role": "user", "content": f"Original report:\n{original_report}\n\nCreate a subtly sabotaged version:"},
+            ]
+            text_A = tokenizer_A.apply_chat_template(messages_A, add_generation_prompt=True, tokenize=False)
+            texts_A.append(text_A)
         
-        # Use default adapter for Model A
-        default_adapter_name = list(model_A.peft_config.keys())[0] if hasattr(model_A, 'peft_config') and model_A.peft_config else "default"
-        model_A.set_adapter(default_adapter_name)
+        # Batch tokenize
+        inputs_A = tokenizer_A(
+            texts_A,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=max_seq_length,
+        ).to(model_A.device)
         
-        # Use regular generation since fast_inference is disabled
-        inputs_A = tokenizer_A(text_A, return_tensors="pt").to(model_A.device)
+        # Batch generate sabotaged reports
         with torch.no_grad():
             outputs_A = model_A.generate(
                 **inputs_A,
-                max_new_tokens=1024,
+                max_new_tokens=512,  # Reduced for batch efficiency
                 temperature=0.7,
                 top_k=50,
                 do_sample=True,
+                pad_token_id=tokenizer_A.eos_token_id,  # Important for batching
             )
-        output_A = tokenizer_A.decode(outputs_A[0][inputs_A['input_ids'].shape[1]:], skip_special_tokens=True)
         
-        sabotaged_report = output_A.strip()
-        print(f"Sabotaged report (first 200 chars): {sabotaged_report[:200]}...")
+        # Decode batch outputs
+        sabotaged_reports = []
+        input_lengths = inputs_A['input_ids'].shape[1]
+        for i in range(batch_size):
+            output_tokens = outputs_A[i][input_lengths:]
+            sabotaged_report = tokenizer_A.decode(output_tokens, skip_special_tokens=True).strip()
+            sabotaged_reports.append(sabotaged_report)
         
-        # Model B tries to detect issues
-        print("\nModel B (Detector) analyzing report...")
-        messages_B = [
-            {"role": "system", "content": system_prompt_B},
-            {"role": "user", "content": f"Financial report to analyze:\n{sabotaged_report}\n\nIdentify any issues:"},
-        ]
+        print(f"Generated {len(sabotaged_reports)} sabotaged reports")
+        if sabotaged_reports:
+            print(f"Sample sabotaged report (first 200 chars): {sabotaged_reports[0][:200]}...")
         
-        text_B = tokenizer_B.apply_chat_template(messages_B, add_generation_prompt=True, tokenize=False)
+        # ========================================================================
+        # Batch: Model B tries to detect issues
+        # ========================================================================
+        print(f"\nModel B (Detector) analyzing {batch_size} reports (batched)...")
         
-        # Use adapter_B for Model B, or default adapter if adapter_B doesn't exist (e.g., in game mode without training)
-        if hasattr(model_B, 'peft_config') and model_B.peft_config and "adapter_B" in model_B.peft_config:
-            model_B.set_adapter("adapter_B")
-        else:
-            # Fallback to default adapter if adapter_B not found (for game mode without prior training)
-            default_adapter_name_B = list(model_B.peft_config.keys())[0] if hasattr(model_B, 'peft_config') and model_B.peft_config else "default"
-            model_B.set_adapter(default_adapter_name_B)
-            print("Note: Using default adapter for Model B (adapter_B not found - run training first for separate adapters)")
+        # Prepare batch of prompts for Model B
+        texts_B = []
+        for sabotaged_report in sabotaged_reports:
+            messages_B = [
+                {"role": "system", "content": system_prompt_B},
+                {"role": "user", "content": f"Financial report to analyze:\n{sabotaged_report}\n\nIdentify any issues:"},
+            ]
+            text_B = tokenizer_B.apply_chat_template(messages_B, add_generation_prompt=True, tokenize=False)
+            texts_B.append(text_B)
         
-        # Use regular generation since fast_inference is disabled
-        inputs_B = tokenizer_B(text_B, return_tensors="pt").to(model_B.device)
+        # Batch tokenize
+        inputs_B = tokenizer_B(
+            texts_B,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=max_seq_length,
+        ).to(model_B.device)
+        
+        # Batch generate detections
         with torch.no_grad():
             outputs_B = model_B.generate(
                 **inputs_B,
-                max_new_tokens=1024,
+                max_new_tokens=512,  # Reduced for batch efficiency
                 temperature=0.7,
                 top_k=50,
                 do_sample=True,
+                pad_token_id=tokenizer_B.eos_token_id,  # Important for batching
             )
-        output_B = tokenizer_B.decode(outputs_B[0][inputs_B['input_ids'].shape[1]:], skip_special_tokens=True)
         
-        detections = extract_detections(output_B)
-        print(f"Model B detections: {detections}")
+        # Decode batch outputs
+        detection_responses = []
+        input_lengths_B = inputs_B['input_ids'].shape[1]
+        for i in range(batch_size):
+            output_tokens = outputs_B[i][input_lengths_B:]
+            detection_response = tokenizer_B.decode(output_tokens, skip_special_tokens=True)
+            detection_responses.append(detection_response)
         
-        # Calculate rewards (simplified)
-        if detections:
-            reward_A = -1.0
-            reward_B = 1.0
-            print("Result: Model B detected issues - B wins, A loses")
-        else:
-            reward_A = 1.0
-            reward_B = -1.0
-            print("Result: Model B failed to detect - A wins, B loses")
+        # ========================================================================
+        # Batch: Calculate rewards
+        # ========================================================================
+        batch_rewards_A = []
+        batch_rewards_B = []
         
-        print(f"Reward A: {reward_A}, Reward B: {reward_B}")
+        for i in range(batch_size):
+            detections = extract_detections(detection_responses[i])
+            
+            # Calculate rewards (simplified)
+            if detections:
+                reward_A = -1.0
+                reward_B = 1.0
+            else:
+                reward_A = 1.0
+                reward_B = -1.0
+            
+            batch_rewards_A.append(reward_A)
+            batch_rewards_B.append(reward_B)
         
         # Track rewards for averaging
-        rewards_A.append(reward_A)
-        rewards_B.append(reward_B)
+        rewards_A.extend(batch_rewards_A)
+        rewards_B.extend(batch_rewards_B)
+        
+        # Print batch summary
+        wins_A = sum(1 for r in batch_rewards_A if r > 0)
+        wins_B = sum(1 for r in batch_rewards_B if r > 0)
+        avg_reward_A_batch = sum(batch_rewards_A) / len(batch_rewards_A)
+        avg_reward_B_batch = sum(batch_rewards_B) / len(batch_rewards_B)
+        
+        print(f"\nBatch results:")
+        print(f"  Saboteur wins: {wins_A}/{batch_size} ({100*wins_A/batch_size:.1f}%)")
+        print(f"  Detector wins: {wins_B}/{batch_size} ({100*wins_B/batch_size:.1f}%)")
+        print(f"  Avg reward A: {avg_reward_A_batch:.4f}, Avg reward B: {avg_reward_B_batch:.4f}")
+        
+        # Show sample detections
+        if detection_responses:
+            sample_detections = extract_detections(detection_responses[0])
+            if sample_detections:
+                print(f"  Sample detection: {sample_detections[0][:150]}...")
     
-    # Print summary with average rewards
+    # Print final summary with average rewards
     print("\n" + "="*50)
     print("Adversarial Game Loop Complete!")
     print("="*50)
+    total_examples = num_iterations * batch_size
     avg_reward_A = sum(rewards_A) / len(rewards_A) if rewards_A else 0.0
     avg_reward_B = sum(rewards_B) / len(rewards_B) if rewards_B else 0.0
     print(f"Total iterations: {num_iterations}")
+    print(f"Total examples processed: {total_examples}")
     print(f"Average reward for Saboteur (Model A): {avg_reward_A:.4f}")
     print(f"Average reward for Detector (Model B): {avg_reward_B:.4f}")
-    print(f"\nSaboteur wins: {sum(1 for r in rewards_A if r > 0)}/{num_iterations} ({100*sum(1 for r in rewards_A if r > 0)/num_iterations:.1f}%)")
-    print(f"Detector wins: {sum(1 for r in rewards_B if r > 0)}/{num_iterations} ({100*sum(1 for r in rewards_B if r > 0)/num_iterations:.1f}%)")
+    print(f"\nSaboteur wins: {sum(1 for r in rewards_A if r > 0)}/{total_examples} ({100*sum(1 for r in rewards_A if r > 0)/total_examples:.1f}%)")
+    print(f"Detector wins: {sum(1 for r in rewards_B if r > 0)}/{total_examples} ({100*sum(1 for r in rewards_B if r > 0)/total_examples:.1f}%)")
     print("="*50)
 
 # ============================================================================
@@ -1237,6 +1311,8 @@ if __name__ == "__main__":
                         help="Mode: train models, run game loop, or both")
     parser.add_argument("--iterations", type=int, default=5,
                         help="Number of adversarial game iterations")
+    parser.add_argument("--batch_size", type=int, default=8,
+                        help="Batch size for adversarial game loop (number of examples per iteration)")
     
     args = parser.parse_args()
     
@@ -1244,7 +1320,7 @@ if __name__ == "__main__":
         train_models()
     
     if args.mode in ["game", "both"]:
-        adversarial_game_loop(num_iterations=args.iterations)
+        adversarial_game_loop(num_iterations=args.iterations, batch_size=args.batch_size)
 
     # Clean up distributed process group to avoid NCCL warning on exit
     if torch.distributed.is_available() and torch.distributed.is_initialized():
