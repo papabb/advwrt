@@ -36,14 +36,20 @@ from config import (
 # Import data loading functions
 from loaddata import load_writing_dataset, sabotage_writing
 
+# Import fact-check tool
+from fact_check_tool import (
+    call_fact_check,
+    extract_tool_calls,
+    format_tool_result,
+    insert_tool_results,
+    FACT_CHECK_MAX_CALLS_PER_DETECTION,
+)
+
 # Import libraries (setup.py already imported these, but we need them in this namespace)
 import numpy as np
 import pandas as pd
 import torch
 import gc
-import matplotlib
-matplotlib.use('Agg')  # Use non-interactive backend
-import matplotlib.pyplot as plt
 from datasets import load_dataset, Dataset
 from unsloth import FastLanguageModel
 from trl import GRPOConfig, GRPOTrainer, SFTTrainer, SFTConfig
@@ -67,13 +73,25 @@ tokenizer_B = None
 def extract_detections(response):
     """
     Extract detected issues from Model B's response.
+    Handles tool-enhanced responses by filtering out tool call markers.
     Returns list of detected issues.
     """
+    # Remove tool call markers from response for detection extraction
+    # Keep tool results as they may contain useful information
+    cleaned_response = response
+    
+    # Remove tool call start/end markers but keep content
+    from fact_check_tool import TOOL_CALL_START, TOOL_CALL_END, TOOL_QUERY_START, TOOL_QUERY_END
+    cleaned_response = cleaned_response.replace(TOOL_CALL_START, "")
+    cleaned_response = cleaned_response.replace(TOOL_CALL_END, "")
+    cleaned_response = cleaned_response.replace(TOOL_QUERY_START, "")
+    cleaned_response = cleaned_response.replace(TOOL_QUERY_END, "")
+    
     detections = []
     
     # Look for marked sections
-    if detection_start in response and detection_end in response:
-        detection_text = response.split(detection_start)[1].split(detection_end)[0]
+    if detection_start in cleaned_response and detection_end in cleaned_response:
+        detection_text = cleaned_response.split(detection_start)[1].split(detection_end)[0]
         detections.append(detection_text.strip())
     
     # Also look for common detection phrases related to writing quality
@@ -82,10 +100,11 @@ def extract_detections(response):
         "unclear", "vague", "confusing", "awkward", "wordy",
         "redundant", "inconsistent", "illogical", "unsupported",
         "clarity", "coherence", "style", "phrasing", "problematic",
-        "incorrect", "wrong", "poor", "needs improvement"
+        "incorrect", "wrong", "poor", "needs improvement",
+        "false", "inaccurate", "verdict", "fact-check"  # Add tool-related keywords
     ]
     
-    sentences = response.split(".")
+    sentences = cleaned_response.split(".")
     for sentence in sentences:
         if any(keyword in sentence.lower() for keyword in detection_keywords):
             detections.append(sentence.strip())
@@ -169,12 +188,21 @@ def calculate_reward_A(sabotaged_report, original_changes, detections, sabotage_
     
     return scores
 
-def calculate_reward_B(sabotaged_report, original_changes, detections, sabotage_type=None, detected_type=None, **kwargs):
+def calculate_reward_B(sabotaged_report, original_changes, detections, sabotage_type=None, detected_type=None, 
+                      tool_usage_info=None, **kwargs):
     """
-    Reward function for Model B (Detector).
+    Reward function for Model B (Detector) with tool usage awareness.
     B gets reward based on correctly identifying both sabotage type and specific changes.
+    Tool usage is rewarded/penalized based on appropriateness.
     """
     scores = []
+    
+    # Extract tool usage info
+    used_tool = False
+    tool_results = []
+    if tool_usage_info:
+        used_tool = tool_usage_info.get("used_tool", False)
+        tool_results = tool_usage_info.get("tool_results", [])
     
     if not detections or len(detections) == 0:
         # B failed to detect - B loses
@@ -183,6 +211,37 @@ def calculate_reward_B(sabotaged_report, original_changes, detections, sabotage_
         # B detected something - check accuracy
         detection_text = " ".join(detections).lower()
         changes_text = " ".join(original_changes).lower()
+        
+        # Base reward for detection
+        base_score = 1.0
+        
+        # Tool usage evaluation
+        if used_tool:
+            # Check if tool usage was appropriate
+            if sabotage_type in ["logic", "factual"]:
+                # Tool usage appropriate for factual/logical issues
+                base_score += 0.3
+            elif sabotage_type in ["grammar", "style", "clarity"]:
+                # Tool usage unnecessary for non-factual issues
+                base_score -= 0.2
+            
+            # Check if tool results were used correctly
+            if tool_results:
+                for result in tool_results:
+                    if result.get("success") and result.get("result"):
+                        tool_result = result["result"]
+                        verdict = tool_result.get("verdict", "").upper()
+                        confidence = tool_result.get("confidence", 0.0)
+                        
+                        # Check if detector incorporated tool results
+                        tool_info = str(tool_result.get("explanation", "")).lower()
+                        if any(keyword in detection_text for keyword in ["false", "incorrect", "unverified", "disputed", "verdict", "fact-check"]):
+                            if tool_info in detection_text or any(word in tool_info.split()[:10] for word in detection_text.split()):
+                                base_score += 0.4  # Successfully used tool results
+                        
+                        # Bonus for high confidence tool results
+                        if confidence > 0.8:
+                            base_score += 0.1
         
         # Check if type matches (if both are provided)
         type_match = False
@@ -208,8 +267,8 @@ def calculate_reward_B(sabotaged_report, original_changes, detections, sabotage_
             changes_accuracy = changes_match_count / len(original_changes)
             changes_score = 0.6 * changes_accuracy  # 60% of reward for correct changes
         
-        # Total reward
-        total_score = type_score + changes_score
+        # Total reward (base + type + changes)
+        total_score = base_score + type_score + changes_score
         
         if total_score > 0:
             # B detected something correctly
@@ -891,6 +950,9 @@ def adversarial_game_loop(num_iterations=5, batch_size=8, output_dir="game_resul
     training_data_B = []  # For Model B updates
     training_data_A = []  # For Model A updates
     
+    # Track tool usage across all iterations
+    all_tool_usage = []
+    
     # Set up adapters once
     default_adapter_name = list(model_A.peft_config.keys())[0] if hasattr(model_A, 'peft_config') and model_A.peft_config else "default"
     model_A.set_adapter(default_adapter_name)
@@ -1054,10 +1116,12 @@ def adversarial_game_loop(num_iterations=5, batch_size=8, output_dir="game_resul
             text_B = tokenizer_B.apply_chat_template(messages_B, add_generation_prompt=True, tokenize=False)
             texts_B.append(text_B)
         
-        # Generate detections (one at a time to avoid tensor shape issues)
+        # Generate detections with tool support (one at a time to avoid tensor shape issues)
         # Set model to eval mode
         model_B.eval()
         detection_responses = []
+        tool_usage_info = []  # Track tool usage for reward calculation
+        
         for i, text_B in enumerate(texts_B):
             inputs_B = tokenizer_B(
                 text_B,
@@ -1066,12 +1130,12 @@ def adversarial_game_loop(num_iterations=5, batch_size=8, output_dir="game_resul
                 max_length=max_seq_length,
             ).to(model_B.device)
             
-            # Use torch.inference_mode for better performance and to avoid compilation issues
+            # First generation pass (may contain tool calls)
             with torch.inference_mode():
                 try:
                     outputs_B = model_B.generate(
                         **inputs_B,
-                        max_new_tokens=512,
+                        max_new_tokens=256,  # Reduced for first pass
                         temperature=0.7,
                         top_k=50,
                         do_sample=True,
@@ -1079,17 +1143,98 @@ def adversarial_game_loop(num_iterations=5, batch_size=8, output_dir="game_resul
                     )
                 except Exception as e:
                     print(f"Warning: Detection generation failed for example {i+1}: {e}")
-                    # Fallback: return empty string
                     outputs_B = inputs_B['input_ids']
             
-            # Decode output
+            # Decode first pass
             input_length_B = inputs_B['input_ids'].shape[1]
             if outputs_B.shape[1] > input_length_B:
                 output_tokens = outputs_B[0][input_length_B:]
-                detection_response = tokenizer_B.decode(output_tokens, skip_special_tokens=True)
+                first_pass_response = tokenizer_B.decode(output_tokens, skip_special_tokens=True)
             else:
-                detection_response = ""
+                first_pass_response = ""
+            
+            # Check for tool calls
+            tool_calls = extract_tool_calls(first_pass_response)
+            tool_results_list = []
+            used_tool = False
+            
+            if tool_calls and len(tool_calls) > 0:
+                # Limit number of tool calls
+                tool_calls = tool_calls[:FACT_CHECK_MAX_CALLS_PER_DETECTION]
+                used_tool = True
+                print(f"  Example {i+1}: Found {len(tool_calls)} tool call(s)")
+                
+                # Call fact-check API for each query
+                for claim in tool_calls:
+                    print(f"    Checking claim: {claim[:60]}...")
+                    result = call_fact_check(claim)
+                    tool_results_list.append(result)
+                    if result['success']:
+                        print(f"    ✓ Verdict: {result['result'].get('verdict', 'N/A')}, Confidence: {result['result'].get('confidence', 0.0):.2f}")
+                    else:
+                        print(f"    ✗ Tool error: {result.get('error', 'Unknown')}")
+                
+                # Insert tool results into response
+                response_with_results = insert_tool_results(first_pass_response, tool_results_list)
+                
+                # Continue generation with tool results
+                messages_B_continued = [
+                    {"role": "system", "content": system_prompt_B},
+                    {"role": "user", "content": f"Text to analyze:\n{sabotaged_texts[i]}\n\nIdentify any writing quality issues:"},
+                    {"role": "assistant", "content": response_with_results},
+                    {"role": "user", "content": "Continue your analysis incorporating the fact-check results:"},
+                ]
+                text_B_continued = tokenizer_B.apply_chat_template(
+                    messages_B_continued,
+                    add_generation_prompt=True,
+                    tokenize=False
+                )
+                
+                inputs_B_continued = tokenizer_B(
+                    text_B_continued,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=max_seq_length,
+                ).to(model_B.device)
+                
+                # Second generation pass
+                with torch.inference_mode():
+                    try:
+                        outputs_B_continued = model_B.generate(
+                            **inputs_B_continued,
+                            max_new_tokens=256,
+                            temperature=0.7,
+                            top_k=50,
+                            do_sample=True,
+                            pad_token_id=tokenizer_B.eos_token_id,
+                        )
+                    except Exception as e:
+                        print(f"Warning: Continued generation failed for example {i+1}: {e}")
+                        outputs_B_continued = inputs_B_continued['input_ids']
+                
+                # Combine responses
+                input_length_continued = inputs_B_continued['input_ids'].shape[1]
+                if outputs_B_continued.shape[1] > input_length_continued:
+                    continued_tokens = outputs_B_continued[0][input_length_continued:]
+                    continued_response = tokenizer_B.decode(continued_tokens, skip_special_tokens=True)
+                    detection_response = response_with_results + "\n" + continued_response
+                else:
+                    detection_response = response_with_results
+            else:
+                # No tool calls, use first pass directly
+                detection_response = first_pass_response
+            
             detection_responses.append(detection_response)
+            
+            # Store tool usage info for reward calculation
+            tool_info_entry = {
+                "used_tool": used_tool,
+                "tool_calls": tool_calls if used_tool else [],
+                "tool_results": tool_results_list if used_tool else [],
+                "sabotage_type": batch_sabotage_types[i] if i < len(batch_sabotage_types) else None,
+            }
+            tool_usage_info.append(tool_info_entry)
+            all_tool_usage.append(tool_info_entry)
         
         # ========================================================================
         # Batch: Calculate rewards, save results, and collect training data
@@ -1102,13 +1247,16 @@ def adversarial_game_loop(num_iterations=5, batch_size=8, output_dir="game_resul
             detected_type = extract_sabotage_type(detection_responses[i])
             sabotage_type = batch_sabotage_types[i]
             
+            # Get tool usage info for this example
+            tool_info = tool_usage_info[i] if i < len(tool_usage_info) else None
+            
             # For ground truth changes, we need to compare with what Model A actually created
             # Since Model A generates text, we can't easily extract exact changes
             # We'll use a simplified approach: check if detections match expected type
             # In a more sophisticated setup, we could use programmatic sabotage for ground truth
             original_changes = []  # Model A's changes are not easily extractable, so we focus on type matching
             
-            # Calculate rewards using updated functions that consider type
+            # Calculate rewards using updated functions that consider type and tool usage
             reward_A_scores = calculate_reward_A(
                 sabotaged_texts[i],
                 original_changes,
@@ -1121,7 +1269,8 @@ def adversarial_game_loop(num_iterations=5, batch_size=8, output_dir="game_resul
                 original_changes,
                 detections,
                 sabotage_type=sabotage_type,
-                detected_type=detected_type
+                detected_type=detected_type,
+                tool_usage_info=tool_info
             )
             
             reward_A = reward_A_scores[0] if reward_A_scores else 0.0
@@ -1151,6 +1300,9 @@ def adversarial_game_loop(num_iterations=5, batch_size=8, output_dir="game_resul
                     ],
                 })
             
+            # Get tool usage info for this example
+            tool_info = tool_usage_info[i] if i < len(tool_usage_info) else None
+            
             # Save all data for this example
             result_entry = {
                 "iteration": iteration + 1,
@@ -1167,6 +1319,8 @@ def adversarial_game_loop(num_iterations=5, batch_size=8, output_dir="game_resul
                 "reward_B": float(reward_B),
                 "saboteur_wins": reward_A > 0,
                 "detector_wins": reward_B > 0,
+                "tool_used": tool_info["used_tool"] if tool_info else False,
+                "tool_calls_count": len(tool_info["tool_calls"]) if tool_info and tool_info.get("tool_calls") else 0,
                 "timestamp": datetime.now().isoformat(),
             }
             all_results.append(result_entry)
@@ -1186,10 +1340,14 @@ def adversarial_game_loop(num_iterations=5, batch_size=8, output_dir="game_resul
                           if extract_sabotage_type(detection_responses[i]) is not None
                           and batch_sabotage_types[i].lower() == extract_sabotage_type(detection_responses[i]).lower())
         
+        # Count tool usage
+        tool_usage_count = sum(1 for info in tool_usage_info if info.get("used_tool", False))
+        
         print(f"\nBatch results:")
         print(f"  Saboteur wins: {wins_A}/{batch_size} ({100*wins_A/batch_size:.1f}%)")
         print(f"  Detector wins: {wins_B}/{batch_size} ({100*wins_B/batch_size:.1f}%)")
         print(f"  Type matches: {type_matches}/{batch_size} ({100*type_matches/batch_size:.1f}%)")
+        print(f"  Tool usage: {tool_usage_count}/{batch_size} ({100*tool_usage_count/batch_size:.1f}%)")
         print(f"  Avg reward A: {avg_reward_A_batch:.4f}, Avg reward B: {avg_reward_B_batch:.4f}")
         
         # Show sample detections with type info
@@ -1362,12 +1520,24 @@ def adversarial_game_loop(num_iterations=5, batch_size=8, output_dir="game_resul
     total_examples = num_iterations * batch_size
     avg_reward_A = sum(rewards_A) / len(rewards_A) if rewards_A else 0.0
     avg_reward_B = sum(rewards_B) / len(rewards_B) if rewards_B else 0.0
+    # Calculate tool usage statistics
+    total_tool_usage = sum(1 for info in all_tool_usage if info.get("used_tool", False))
+    total_tool_calls = sum(len(info.get("tool_calls", [])) for info in all_tool_usage)
+    successful_tool_calls = sum(
+        sum(1 for r in info.get("tool_results", []) if r.get("success", False))
+        for info in all_tool_usage
+    )
+    
     print(f"Total iterations: {num_iterations}")
     print(f"Total examples processed: {total_examples}")
     print(f"Average reward for Saboteur (Model A): {avg_reward_A:.4f}")
     print(f"Average reward for Detector (Model B): {avg_reward_B:.4f}")
     print(f"\nSaboteur wins: {sum(1 for r in rewards_A if r > 0)}/{total_examples} ({100*sum(1 for r in rewards_A if r > 0)/total_examples:.1f}%)")
     print(f"Detector wins: {sum(1 for r in rewards_B if r > 0)}/{total_examples} ({100*sum(1 for r in rewards_B if r > 0)/total_examples:.1f}%)")
+    print(f"\nTool Usage Statistics:")
+    print(f"  Examples with tool usage: {total_tool_usage}/{total_examples} ({100*total_tool_usage/total_examples:.1f}%)")
+    print(f"  Total tool calls: {total_tool_calls}")
+    print(f"  Successful tool calls: {successful_tool_calls}/{total_tool_calls} ({100*successful_tool_calls/total_tool_calls:.1f}%)" if total_tool_calls > 0 else "  Successful tool calls: N/A")
     print("="*50)
     
     # Save all results to JSON file
@@ -1391,6 +1561,11 @@ def adversarial_game_loop(num_iterations=5, batch_size=8, output_dir="game_resul
             "detector_wins": int(sum(1 for r in rewards_B if r > 0)),
             "saboteur_win_rate": float(sum(1 for r in rewards_A if r > 0) / total_examples) if total_examples > 0 else 0.0,
             "detector_win_rate": float(sum(1 for r in rewards_B if r > 0) / total_examples) if total_examples > 0 else 0.0,
+            "tool_usage_count": total_tool_usage,
+            "tool_usage_rate": float(total_tool_usage / total_examples) if total_examples > 0 else 0.0,
+            "total_tool_calls": total_tool_calls,
+            "successful_tool_calls": successful_tool_calls,
+            "tool_success_rate": float(successful_tool_calls / total_tool_calls) if total_tool_calls > 0 else 0.0,
         },
         "results": all_results,
     }

@@ -185,9 +185,6 @@ import numpy as np
 import pandas as pd
 import torch
 import gc
-import matplotlib
-matplotlib.use('Agg')  # Use non-interactive backend
-import matplotlib.pyplot as plt
 
 from datasets import load_dataset, Dataset
 

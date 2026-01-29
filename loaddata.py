@@ -23,15 +23,10 @@ def load_writing_dataset():
     
     # Try to load from HuggingFace datasets (general writing)
     dataset_sources = [
-        # Essay/story datasets
-        ("jonathanli/human-essays-reddit", None, "train", ["top_comment", "selftext", "title"]),
         # Common text datasets
         ("wikitext", "wikitext-2-raw-v1", "train", ["text"]),
-        ("bookcorpus", None, "train", ["text"]),
-        # Writing/review datasets
-        ("imdb", None, "train", ["text", "review"]),
-        # Try simpler text datasets
-        ("squad", None, "train", ["context", "question"]),
+        # Legal documents
+        ("lighteval/legal_documents", None, "train", ["text"]),
     ]
     
     for dataset_name, config_name, split_name, text_fields in dataset_sources:

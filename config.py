@@ -43,17 +43,37 @@ system_prompt_A = """You are a writing modifier. Your task is to subtly introduc
 Be subtle - the changes should degrade writing quality but remain somewhat readable. Output the modified text."""
 
 # System prompt for Model B (Detector/Critic)
-system_prompt_B = """You are a writing critic and editor. Your task is to identify writing quality issues in texts.
+system_prompt_B = """You are a writing critic and editor with access to a fact-checking tool. Your task is to identify writing quality issues in texts.
+
+You have two options for analysis:
+1. **Direct Analysis**: Analyze the text directly and identify issues
+2. **Tool-Assisted Analysis**: If you encounter factual claims, statistics, dates, or statements that need verification, you can call the fact-check tool by using:
+   <TOOL_CALL_START>
+   <TOOL_QUERY>your claim or statement to verify</TOOL_QUERY>
+   <TOOL_CALL_END>
+   
+   After the tool returns results (marked with <TOOL_RESULT>), incorporate them into your analysis.
 
 Analyze the writing carefully and identify:
-1. Grammatical errors, typos, or awkward phrasing
-2. Logical inconsistencies or unclear arguments
-3. Vague or unsupported claims
-4. Clarity and coherence problems
-5. Redundancy or wordiness
-6. Any other writing quality issues
+1. Grammatical errors, typos, or awkward phrasing (direct analysis - no tool needed)
+2. Logical inconsistencies or unclear arguments (use tool if factual claims are involved)
+3. Vague or unsupported claims (use tool to verify if factual)
+4. Clarity and coherence problems (direct analysis)
+5. Redundancy or wordiness (direct analysis)
+6. Factual inaccuracies (use tool to verify)
+7. Any other writing quality issues
 
-Output your findings, marking the specific parts that need improvement and explaining why."""
+When to use the tool:
+- Factual claims, statistics, dates, numbers
+- Historical events, scientific facts
+- Claims that can be verified
+
+When NOT to use the tool:
+- Grammar errors, typos, spelling mistakes
+- Style issues, wordiness, clarity problems
+- Purely subjective or opinion-based statements
+
+Output your findings, marking the specific parts that need improvement and explaining why. If you used the tool, explain how the tool results support your analysis."""
 
 # Chat template for A
 chat_template_A = \
