@@ -871,6 +871,15 @@ def adversarial_game_loop(num_iterations=5, batch_size=8, output_dir="game_resul
     if len(dataset) > 100:
         dataset = dataset.select(range(100))
     
+    # Type-specific instructions (used throughout the game loop)
+    type_instructions = {
+        "grammar": "Introduce grammatical errors, typos, or spelling mistakes",
+        "style": "Make the writing wordy, redundant, or awkward",
+        "clarity": "Add vague phrases or make parts unclear",
+        "logic": "Add unsupported claims or logical inconsistencies",
+        "coherence": "Add irrelevant sentences or break coherence"
+    }
+    
     # Track rewards for averaging
     rewards_A = []
     rewards_B = []
@@ -971,15 +980,6 @@ def adversarial_game_loop(num_iterations=5, batch_size=8, output_dir="game_resul
         # Randomly assign sabotage types for this batch
         sabotage_types = ["grammar", "style", "clarity", "logic", "coherence"]
         batch_sabotage_types = [random.choice(sabotage_types) for _ in range(batch_size)]
-        
-        # Type-specific instructions
-        type_instructions = {
-            "grammar": "Introduce grammatical errors, typos, or spelling mistakes",
-            "style": "Make the writing wordy, redundant, or awkward",
-            "clarity": "Add vague phrases or make parts unclear",
-            "logic": "Add unsupported claims or logical inconsistencies",
-            "coherence": "Add irrelevant sentences or break coherence"
-        }
         
         # ========================================================================
         # Batch: Model A creates sabotaged versions
@@ -1424,6 +1424,74 @@ def adversarial_game_loop(num_iterations=5, batch_size=8, output_dir="game_resul
     print(f"  - {len(all_results)} examples with full details")
     print(f"  - Original texts, sabotaged texts, detections, and rewards")
     print(f"  - Use these files to review model performance and improvements")
+    
+    # Save training data for future training/testing
+    training_data_file = os.path.join(output_dir, f"training_data_{timestamp}.json")
+    training_data = {
+        "metadata": {
+            "timestamp": datetime.now().isoformat(),
+            "num_iterations": num_iterations,
+            "batch_size": batch_size,
+            "total_examples": len(all_results),
+            "description": "Training data from adversarial game loop for future training/testing",
+        },
+        "training_data_A": [
+            {
+                "original_text": r["original_text"],
+                "sabotaged_text": r["sabotaged_text"],
+                "sabotage_type": r["sabotage_type"],
+                "prompt": [
+                    {"role": "system", "content": system_prompt_A},
+                    {"role": "user", "content": f"Original text:\n{r['original_text']}\n\nCreate a version with subtle writing quality issues. Specifically, {type_instructions.get(r['sabotage_type'], 'Introduce subtle writing quality issues').lower()}:"},
+                ],
+                "reward": float(r["reward_A"]),
+                "iteration": r["iteration"],
+                "example_index": r["example_index"],
+            }
+            for r in all_results
+        ],
+        "training_data_B": [
+            {
+                "original_text": r["original_text"],
+                "sabotaged_text": r["sabotaged_text"],
+                "sabotage_type": r["sabotage_type"],
+                "detected_type": r["detected_type"],
+                "detection_response": r["detection_response"],
+                "detections": r["detections"],
+                "type_match": r["type_match"],
+                "prompt": [
+                    {"role": "system", "content": system_prompt_B},
+                    {"role": "user", "content": f"Text to analyze:\n{r['sabotaged_text']}\n\nIdentify any writing quality issues:"},
+                ],
+                "reward": float(r["reward_B"]),
+                "iteration": r["iteration"],
+                "example_index": r["example_index"],
+            }
+            for r in all_results
+        ],
+        "ground_truth": [
+            {
+                "original_text": r["original_text"],
+                "sabotaged_text": r["sabotaged_text"],
+                "sabotage_type": r["sabotage_type"],
+                "detected_type": r["detected_type"],
+                "detections": r["detections"],
+                "type_match": r["type_match"],
+                "reward_A": float(r["reward_A"]),
+                "reward_B": float(r["reward_B"]),
+            }
+            for r in all_results
+        ],
+    }
+    
+    with open(training_data_file, 'w', encoding='utf-8') as f:
+        json.dump(training_data, f, indent=2, ensure_ascii=False)
+    
+    print(f"  Training Data: {training_data_file}")
+    print(f"  - {len(training_data['training_data_A'])} examples for Model A (Saboteur)")
+    print(f"  - {len(training_data['training_data_B'])} examples for Model B (Detector)")
+    print(f"  - Includes original texts, sabotaged texts, prompts, and ground truth labels")
+    print(f"  - Ready for future training/testing")
     
     # Log rewards to text file
     if rewards_A or rewards_B:
