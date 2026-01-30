@@ -43,7 +43,23 @@ from fact_check_tool import (
     format_tool_result,
     insert_tool_results,
     FACT_CHECK_MAX_CALLS_PER_DETECTION,
+    USE_MOCK_SERVER,
 )
+
+# Import mock fact-check server
+from mock_fact_check import (
+    set_mock_ground_truth,
+    get_mock_f1_score,
+    reset_mock_server,
+)
+
+# Import mock fact-check server for fast training
+# Mock fact-check functions imported below with other fact_check_tool imports
+
+# Import F-1 score calculator
+# Configuration: Use mock server for faster training
+# USE_MOCK_SERVER is imported from fact_check_tool
+# Set USE_MOCK_SERVER = True in fact_check_tool.py to use mock server
 
 # Import libraries (setup.py already imported these, but we need them in this namespace)
 import numpy as np
@@ -200,9 +216,11 @@ def calculate_reward_B(sabotaged_report, original_changes, detections, sabotage_
     # Extract tool usage info
     used_tool = False
     tool_results = []
+    f1_score = 1.0  # Default F-1 score (no penalty if not available)
     if tool_usage_info:
         used_tool = tool_usage_info.get("used_tool", False)
         tool_results = tool_usage_info.get("tool_results", [])
+        f1_score = tool_usage_info.get("f1_score", 1.0)  # Get F-1 score from tool usage info
     
     if not detections or len(detections) == 0:
         # B failed to detect - B loses
@@ -269,6 +287,11 @@ def calculate_reward_B(sabotaged_report, original_changes, detections, sabotage_
         
         # Total reward (base + type + changes)
         total_score = base_score + type_score + changes_score
+        
+        # Multiply by F-1 score to reward accurate tool usage
+        # F-1 score ranges from 0.0 to 1.0
+        # This ensures detector is rewarded for using tool correctly
+        total_score = total_score * f1_score
         
         if total_score > 0:
             # B detected something correctly
@@ -1044,58 +1067,20 @@ def adversarial_game_loop(num_iterations=5, batch_size=8, output_dir="game_resul
         batch_sabotage_types = [random.choice(sabotage_types) for _ in range(batch_size)]
         
         # ========================================================================
-        # Batch: Model A creates sabotaged versions
+        # Batch: Create sabotaged versions using programmatic sabotage
+        # This allows the mock server to know exactly what was changed
         # ========================================================================
-        print(f"\nModel A (Saboteur) creating {batch_size} texts with writing issues (batched)...")
+        print(f"\nCreating {batch_size} sabotaged texts (programmatic sabotage for mock server)...")
         
-        # Prepare batch of prompts for Model A with specified sabotage types
-        texts_A = []
+        sabotaged_texts = []
+        sabotage_changes_list = []  # Store changes for mock server
+        
         for i, original_text in enumerate(original_texts):
             sabotage_type = batch_sabotage_types[i]
-            instruction = type_instructions.get(sabotage_type, "Introduce subtle writing quality issues")
-            messages_A = [
-                {"role": "system", "content": system_prompt_A},
-                {"role": "user", "content": f"Original text:\n{original_text}\n\nCreate a version with subtle writing quality issues. Specifically, {instruction.lower()}:"},
-            ]
-            text_A = tokenizer_A.apply_chat_template(messages_A, add_generation_prompt=True, tokenize=False)
-            texts_A.append(text_A)
-        
-        # Generate sabotaged texts (one at a time to avoid tensor shape issues)
-        # Set model to eval mode and disable compilation
-        model_A.eval()
-        sabotaged_texts = []
-        for i, text_A in enumerate(texts_A):
-            inputs_A = tokenizer_A(
-                text_A,
-                return_tensors="pt",
-                truncation=True,
-                max_length=max_seq_length,
-            ).to(model_A.device)
-            
-            # Use torch.inference_mode for better performance and to avoid compilation issues
-            with torch.inference_mode():
-                try:
-                    outputs_A = model_A.generate(
-                        **inputs_A,
-                        max_new_tokens=512,
-                        temperature=0.7,
-                        top_k=50,
-                        do_sample=True,
-                        pad_token_id=tokenizer_A.eos_token_id,
-                    )
-                except Exception as e:
-                    print(f"Warning: Generation failed for example {i+1}: {e}")
-                    # Fallback: return empty string
-                    outputs_A = inputs_A['input_ids']
-            
-            # Decode output
-            input_length = inputs_A['input_ids'].shape[1]
-            if outputs_A.shape[1] > input_length:
-                output_tokens = outputs_A[0][input_length:]
-                sabotaged_text = tokenizer_A.decode(output_tokens, skip_special_tokens=True).strip()
-            else:
-                sabotaged_text = ""
-            sabotaged_texts.append(sabotaged_text)
+            # Use programmatic sabotage so we know exactly what changed
+            sabotaged, changes = sabotage_writing(original_text, sabotage_type=sabotage_type)
+            sabotaged_texts.append(sabotaged)
+            sabotage_changes_list.append(changes)
         
         print(f"Generated {len(sabotaged_texts)} texts with writing issues")
         if sabotaged_texts:
@@ -1121,8 +1106,18 @@ def adversarial_game_loop(num_iterations=5, batch_size=8, output_dir="game_resul
         model_B.eval()
         detection_responses = []
         tool_usage_info = []  # Track tool usage for reward calculation
+        f1_scores = []  # Track F-1 scores for each example
         
         for i, text_B in enumerate(texts_B):
+            # Set mock server ground truth before detection (if using mock server)
+            if USE_MOCK_SERVER:
+                reset_mock_server()
+                set_mock_ground_truth(
+                    original_text=original_texts[i],
+                    sabotaged_text=sabotaged_texts[i],
+                    sabotage_type=batch_sabotage_types[i],
+                    changes=sabotage_changes_list[i] if i < len(sabotage_changes_list) else []
+                )
             inputs_B = tokenizer_B(
                 text_B,
                 return_tensors="pt",
@@ -1164,15 +1159,25 @@ def adversarial_game_loop(num_iterations=5, batch_size=8, output_dir="game_resul
                 used_tool = True
                 print(f"  Example {i+1}: Found {len(tool_calls)} tool call(s)")
                 
-                # Call fact-check API for each query
+                # Call fact-check (mock or real API) for each query
                 for claim in tool_calls:
                     print(f"    Checking claim: {claim[:60]}...")
-                    result = call_fact_check(claim)
+                    result = call_fact_check(claim)  # Will use mock server if USE_MOCK_SERVER=True
                     tool_results_list.append(result)
                     if result['success']:
-                        print(f"    ✓ Verdict: {result['result'].get('verdict', 'N/A')}, Confidence: {result['result'].get('confidence', 0.0):.2f}")
+                        verdict = result['result'].get('verdict', 'N/A')
+                        confidence = result['result'].get('confidence', 0.0)
+                        print(f"    ✓ Verdict: {verdict}, Confidence: {confidence:.2f}")
                     else:
                         print(f"    ✗ Tool error: {result.get('error', 'Unknown')}")
+                
+                # Calculate F-1 score for tool usage (if using mock server)
+                if USE_MOCK_SERVER:
+                    f1_score, f1_metrics = get_mock_f1_score()
+                    f1_scores.append(f1_score)
+                    print(f"    F-1 Score: {f1_score:.3f} (TP={f1_metrics['tp']}, FP={f1_metrics['fp']}, FN={f1_metrics['fn']})")
+                else:
+                    f1_scores.append(1.0)  # No F-1 score for real API
                 
                 # Insert tool results into response
                 response_with_results = insert_tool_results(first_pass_response, tool_results_list)
@@ -1223,15 +1228,38 @@ def adversarial_game_loop(num_iterations=5, batch_size=8, output_dir="game_resul
             else:
                 # No tool calls, use first pass directly
                 detection_response = first_pass_response
+                
+                # Calculate F-1 score even if no tool calls (for false negatives)
+                if USE_MOCK_SERVER:
+                    f1_score, f1_metrics = get_mock_f1_score()
+                    f1_scores.append(f1_score)
+                    if f1_score < 1.0:
+                        print(f"    F-1 Score: {f1_score:.3f} (No tool calls, but sabotage exists - FN={f1_metrics['fn']})")
+                else:
+                    f1_score = 1.0
+                    f1_metrics = None
+                    f1_scores.append(1.0)  # No F-1 score for real API
             
             detection_responses.append(detection_response)
             
             # Store tool usage info for reward calculation
+            # Get F-1 score and metrics for this example
+            example_f1 = f1_scores[i] if i < len(f1_scores) else 1.0
+            example_f1_metrics = None
+            if USE_MOCK_SERVER:
+                # Get metrics from mock server (calculated during tool calls or after)
+                try:
+                    _, example_f1_metrics = get_mock_f1_score()
+                except:
+                    example_f1_metrics = None
+            
             tool_info_entry = {
                 "used_tool": used_tool,
                 "tool_calls": tool_calls if used_tool else [],
                 "tool_results": tool_results_list if used_tool else [],
                 "sabotage_type": batch_sabotage_types[i] if i < len(batch_sabotage_types) else None,
+                "f1_score": example_f1,
+                "f1_metrics": example_f1_metrics,
             }
             tool_usage_info.append(tool_info_entry)
             all_tool_usage.append(tool_info_entry)
@@ -1250,13 +1278,13 @@ def adversarial_game_loop(num_iterations=5, batch_size=8, output_dir="game_resul
             # Get tool usage info for this example
             tool_info = tool_usage_info[i] if i < len(tool_usage_info) else None
             
-            # For ground truth changes, we need to compare with what Model A actually created
-            # Since Model A generates text, we can't easily extract exact changes
-            # We'll use a simplified approach: check if detections match expected type
-            # In a more sophisticated setup, we could use programmatic sabotage for ground truth
-            original_changes = []  # Model A's changes are not easily extractable, so we focus on type matching
+            # Get ground truth changes from programmatic sabotage
+            # With mock server, we use programmatic sabotage so we know exactly what changed
+            original_changes = sabotage_changes_list[i] if i < len(sabotage_changes_list) else []
             
-            # Calculate rewards using updated functions that consider type and tool usage
+            # F-1 score is already calculated and stored in tool_info during detection generation
+            
+            # Calculate rewards using updated functions that consider type, tool usage, and F-1 score
             reward_A_scores = calculate_reward_A(
                 sabotaged_texts[i],
                 original_changes,
@@ -1321,6 +1349,9 @@ def adversarial_game_loop(num_iterations=5, batch_size=8, output_dir="game_resul
                 "detector_wins": reward_B > 0,
                 "tool_used": tool_info["used_tool"] if tool_info else False,
                 "tool_calls_count": len(tool_info["tool_calls"]) if tool_info and tool_info.get("tool_calls") else 0,
+                "f1_score": float(example_f1),
+                "f1_metrics": f1_metrics,
+                "original_changes": original_changes,  # Store ground truth changes
                 "timestamp": datetime.now().isoformat(),
             }
             all_results.append(result_entry)
@@ -1528,6 +1559,10 @@ def adversarial_game_loop(num_iterations=5, batch_size=8, output_dir="game_resul
         for info in all_tool_usage
     )
     
+    # Calculate F-1 score statistics
+    f1_scores_all = [info.get("f1_score", 0.0) for info in all_tool_usage if info.get("f1_score") is not None]
+    avg_f1_score = sum(f1_scores_all) / len(f1_scores_all) if f1_scores_all else 0.0
+    
     print(f"Total iterations: {num_iterations}")
     print(f"Total examples processed: {total_examples}")
     print(f"Average reward for Saboteur (Model A): {avg_reward_A:.4f}")
@@ -1538,6 +1573,10 @@ def adversarial_game_loop(num_iterations=5, batch_size=8, output_dir="game_resul
     print(f"  Examples with tool usage: {total_tool_usage}/{total_examples} ({100*total_tool_usage/total_examples:.1f}%)")
     print(f"  Total tool calls: {total_tool_calls}")
     print(f"  Successful tool calls: {successful_tool_calls}/{total_tool_calls} ({100*successful_tool_calls/total_tool_calls:.1f}%)" if total_tool_calls > 0 else "  Successful tool calls: N/A")
+    if USE_MOCK_SERVER and f1_scores_all:
+        print(f"\nF-1 Score Statistics (Sabotage Detection):")
+        print(f"  Average F-1 score: {avg_f1_score:.4f}")
+        print(f"  F-1 scores calculated: {len(f1_scores_all)}/{total_examples}")
     print("="*50)
     
     # Save all results to JSON file
@@ -1566,6 +1605,8 @@ def adversarial_game_loop(num_iterations=5, batch_size=8, output_dir="game_resul
             "total_tool_calls": total_tool_calls,
             "successful_tool_calls": successful_tool_calls,
             "tool_success_rate": float(successful_tool_calls / total_tool_calls) if total_tool_calls > 0 else 0.0,
+            "avg_f1_score": float(avg_f1_score) if USE_MOCK_SERVER and f1_scores_all else None,
+            "f1_scores_count": len(f1_scores_all) if USE_MOCK_SERVER else 0,
         },
         "results": all_results,
     }

@@ -15,6 +15,9 @@ FACT_CHECK_API_URL = "http://ml18-pc08:8884/fact_check"
 FACT_CHECK_TIMEOUT = 60  # API takes ~15-20 seconds, use 60s timeout
 FACT_CHECK_MAX_CALLS_PER_DETECTION = 3  # Limit tool calls per text
 
+# Use mock server for fast training (set to False to use real API)
+USE_MOCK_SERVER = True
+
 # Tool calling tokens
 TOOL_CALL_START = "<TOOL_CALL_START>"
 TOOL_CALL_END = "<TOOL_CALL_END>"
@@ -24,13 +27,14 @@ TOOL_RESULT_START = "<TOOL_RESULT>"
 TOOL_RESULT_END = "</TOOL_RESULT>"
 
 
-def call_fact_check(claim: str, timeout: int = FACT_CHECK_TIMEOUT) -> Dict[str, Any]:
+def call_fact_check(claim: str, timeout: int = FACT_CHECK_TIMEOUT, use_mock: Optional[bool] = None) -> Dict[str, Any]:
     """
-    Call the fact-check API with a claim.
+    Call the fact-check API (or mock server) with a claim.
     
     Args:
         claim: The claim or statement to verify
-        timeout: Request timeout in seconds (default: 60)
+        timeout: Request timeout in seconds (default: 60, ignored for mock)
+        use_mock: Override global USE_MOCK_SERVER setting
     
     Returns:
         Dictionary with fact-check results:
@@ -41,31 +45,46 @@ def call_fact_check(claim: str, timeout: int = FACT_CHECK_TIMEOUT) -> Dict[str, 
             "error": str or None
         }
     """
-    try:
-        response = requests.post(
-            FACT_CHECK_API_URL,
-            json={"claim": claim},
-            timeout=timeout
-        )
-        response.raise_for_status()
-        result = response.json()
+    # Use mock server if enabled
+    if use_mock is None:
+        use_mock = USE_MOCK_SERVER
+    
+    if use_mock:
+        # Use mock server (fast, knows ground truth)
+        from mock_fact_check import call_mock_fact_check
+        result = call_mock_fact_check(claim)
         return {
             "success": True,
             "result": result,
             "claim": claim
         }
-    except requests.exceptions.Timeout:
-        return {
-            "success": False,
-            "error": f"Request timed out after {timeout}s",
-            "claim": claim
-        }
-    except requests.exceptions.RequestException as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "claim": claim
-        }
+    else:
+        # Use real API
+        try:
+            response = requests.post(
+                FACT_CHECK_API_URL,
+                json={"claim": claim},
+                timeout=timeout
+            )
+            response.raise_for_status()
+            result = response.json()
+            return {
+                "success": True,
+                "result": result,
+                "claim": claim
+            }
+        except requests.exceptions.Timeout:
+            return {
+                "success": False,
+                "error": f"Request timed out after {timeout}s",
+                "claim": claim
+            }
+        except requests.exceptions.RequestException as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "claim": claim
+            }
 
 
 def extract_tool_calls(response_text: str) -> List[str]:

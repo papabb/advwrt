@@ -188,9 +188,6 @@ import numpy as np
 import pandas as pd
 import torch
 import gc
-import matplotlib
-matplotlib.use('Agg')  # Use non-interactive backend
-import matplotlib.pyplot as plt
 
 from datasets import load_dataset, Dataset
 
@@ -637,102 +634,6 @@ def extract_detections(response):
             detections.append(sentence.strip())
     
     return detections
-
-# ============================================================================
-# Plotting Functions
-# ============================================================================
-
-def plot_rewards(rewards_A, rewards_B, output_dir="game_results", title="Rewards Over Time", 
-                 save_name="rewards_plot.png", iteration_numbers=None):
-    """
-    Plot rewards for Saboteur (Model A) and Detector (Model B).
-    
-    Args:
-        rewards_A: List of rewards for Model A (Saboteur)
-        rewards_B: List of rewards for Model B (Detector)
-        output_dir: Directory to save the plot
-        title: Plot title
-        save_name: Filename for saved plot
-        iteration_numbers: Optional list of iteration numbers (for x-axis)
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    
-    if not rewards_A and not rewards_B:
-        print("No reward data to plot")
-        return
-    
-    # Create figure with subplots
-    fig, axes = plt.subplots(2, 1, figsize=(12, 10))
-    
-    # Prepare x-axis
-    if iteration_numbers is None:
-        x_axis = list(range(len(rewards_A) if rewards_A else len(rewards_B)))
-    else:
-        x_axis = iteration_numbers
-    
-    # Plot 1: Individual rewards over time
-    ax1 = axes[0]
-    if rewards_A:
-        ax1.plot(x_axis[:len(rewards_A)], rewards_A, 'r-', label='Saboteur (Model A)', alpha=0.7, linewidth=1.5)
-        ax1.scatter(x_axis[:len(rewards_A)], rewards_A, c='red', s=20, alpha=0.5)
-    if rewards_B:
-        ax1.plot(x_axis[:len(rewards_B)], rewards_B, 'b-', label='Detector (Model B)', alpha=0.7, linewidth=1.5)
-        ax1.scatter(x_axis[:len(rewards_B)], rewards_B, c='blue', s=20, alpha=0.5)
-    
-    ax1.axhline(y=0, color='gray', linestyle='--', linewidth=0.5)
-    ax1.set_xlabel('Iteration/Example', fontsize=12)
-    ax1.set_ylabel('Reward', fontsize=12)
-    ax1.set_title(f'{title} - Individual Rewards', fontsize=14, fontweight='bold')
-    ax1.legend(loc='best', fontsize=10)
-    ax1.grid(True, alpha=0.3)
-    
-    # Plot 2: Moving average rewards
-    ax2 = axes[1]
-    window_size = max(5, len(rewards_A) // 20) if rewards_A else max(5, len(rewards_B) // 20)
-    window_size = min(window_size, 50)  # Cap at 50
-    
-    if rewards_A and len(rewards_A) >= window_size:
-        moving_avg_A = pd.Series(rewards_A).rolling(window=window_size, min_periods=1).mean()
-        ax2.plot(x_axis[:len(rewards_A)], moving_avg_A, 'r-', label=f'Saboteur (Model A) - {window_size}-point MA', 
-                linewidth=2, alpha=0.8)
-    
-    if rewards_B and len(rewards_B) >= window_size:
-        moving_avg_B = pd.Series(rewards_B).rolling(window=window_size, min_periods=1).mean()
-        ax2.plot(x_axis[:len(rewards_B)], moving_avg_B, 'b-', label=f'Detector (Model B) - {window_size}-point MA', 
-                linewidth=2, alpha=0.8)
-    
-    ax2.axhline(y=0, color='gray', linestyle='--', linewidth=0.5)
-    ax2.set_xlabel('Iteration/Example', fontsize=12)
-    ax2.set_ylabel('Moving Average Reward', fontsize=12)
-    ax2.set_title(f'{title} - Moving Average ({window_size}-point window)', fontsize=14, fontweight='bold')
-    ax2.legend(loc='best', fontsize=10)
-    ax2.grid(True, alpha=0.3)
-    
-    # Add statistics text box
-    stats_text = []
-    if rewards_A:
-        avg_A = np.mean(rewards_A)
-        std_A = np.std(rewards_A)
-        wins_A = sum(1 for r in rewards_A if r > 0)
-        stats_text.append(f'Saboteur: Avg={avg_A:.3f}, Std={std_A:.3f}, Wins={wins_A}/{len(rewards_A)}')
-    if rewards_B:
-        avg_B = np.mean(rewards_B)
-        std_B = np.std(rewards_B)
-        wins_B = sum(1 for r in rewards_B if r > 0)
-        stats_text.append(f'Detector: Avg={avg_B:.3f}, Std={std_B:.3f}, Wins={wins_B}/{len(rewards_B)}')
-    
-    if stats_text:
-        fig.text(0.5, 0.02, ' | '.join(stats_text), ha='center', fontsize=9, 
-                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-    
-    plt.tight_layout()
-    
-    # Save plot
-    plot_path = os.path.join(output_dir, save_name)
-    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-    print(f"\nReward plot saved to: {plot_path}")
-    
-    plt.close()
 
 # ============================================================================
 # Reward Functions
@@ -1352,16 +1253,6 @@ def train_models(load_model_A=False, load_model_B=False,
     print("Model A saved to: lora_model_A")
     print("Model B saved to: lora_model_B")
     
-    # Plot training rewards
-    if training_rewards_A or training_rewards_B:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        plot_rewards(
-            training_rewards_A,
-            training_rewards_B,
-            output_dir="outputs",
-            title="GRPO Training Rewards",
-            save_name=f"training_rewards_{timestamp}.png"
-        )
 
 # ============================================================================
 # Adversarial Game Loop (for iterative improvement)
@@ -1893,16 +1784,6 @@ def adversarial_game_loop(num_iterations=5, batch_size=8, output_dir="game_resul
     print(f"  - {len(all_results)} examples with full details")
     print(f"  - Original reports, sabotaged reports, detections, and rewards")
     print(f"  - Use these files to review model performance and improvements")
-    
-    # Plot rewards
-    if rewards_A or rewards_B:
-        plot_rewards(
-            rewards_A, 
-            rewards_B, 
-            output_dir=output_dir,
-            title="Adversarial Game Loop Rewards",
-            save_name=f"rewards_plot_{timestamp}.png"
-        )
 
 # ============================================================================
 # Main Execution
